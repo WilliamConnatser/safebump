@@ -50,7 +50,11 @@ Or ask _"what major upgrades are available?"_, or on a dependency-update PR's br
 
 The skill is self-contained: one minified script bundle, nothing to install and no dependencies added to your project. It needs Node 20+ and git.
 
-To roll it out to a team, and to run it automatically in CI on dependency PRs from any bot or person with any agent CLI, see [examples/react-query-v4](examples/react-query-v4). It is a small project that breaks on upgrade, and it contains a GitHub workflow to copy.
+**On every Renovate or Dependabot PR**, `safebump ci` gives the upgrade a verdict. It checks that the upgrade set is complete, that nothing broke relative to the base branch, that nothing was papered over, and that the risky changes are proven: by tests, and by a diff of the dependency's own source for the APIs you use. It posts **blocked**, **low**, **medium** or **high** as a PR comment, plus two statuses. One is required and blocks broken upgrades; the other lets Renovate auto-merge only proven low-risk updates.
+
+That deterministic mode has no AI and no LLM cost. **AI mode is opt-in:** a sandboxed reviewer grades medium- and high-risk updates against your actual API usage and the release notes, and a coding agent fixes broken upgrades. It works with Anthropic, Bedrock, Vertex AI, Foundry, OpenAI, Azure OpenAI, Google AI, or any OpenAI-compatible endpoint.
+
+`safebump init` sets it all up: `safebump.yml`, the GitHub Actions or GitLab CI pipeline, and `renovate.json`. See [examples/react-query-v4](examples/react-query-v4).
 
 ## ⚙️ How it works
 

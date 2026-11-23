@@ -37,7 +37,8 @@ jobs:
       # committed; they must match the source
       - name: Check the committed bundle is up to date
         run: |
-          git diff --exit-code -- skills/safebump || {
+          # new chunk files are untracked, which `git diff` alone would miss
+          if git status --porcelain -- skills/safebump | grep .; then false; fi || {
             echo "skills/safebump is out of date: run 'npm run build' in cli/ and commit the result"
             exit 1
           }
@@ -60,6 +61,8 @@ jobs:
           git add -A && git commit -qm "smoke baseline" --allow-empty
           $B checkpoint save baseline --fast
           $B test-gaps @tanstack/react-query | grep -q "Uncovered"
+          # risk ranking against the target version (static: the example has no tests)
+          $B test-gaps @tanstack/react-query@5.59.0 | grep -q "Risk sites"
           $B impact @tanstack/react-query@5.59.0 --json > impact.json
           node -e '
             const r = require("./impact.json");
@@ -100,3 +103,13 @@ jobs:
           if $B audit > /dev/null; then echo "audit should flag the cast"; exit 1; fi
           git checkout -- src/App.tsx
           $B notes @tanstack/react-query 4.36.1 5.59.0 | grep -q "gcTime"
+          # the Renovate pipeline: an incomplete bot PR must come out blocked
+          git checkout -- .
+          git checkout -q -b renovate/react-query-5
+          sed -i 's#"@tanstack/react-query": "4.36.1"#"@tanstack/react-query": "5.59.0"#' package.json
+          npm install --no-audit --no-fund --loglevel=error
+          git commit -qam "fix(deps): update @tanstack/react-query to v5"
+          if $B ci --base HEAD~1 --outputs ci.env --markdown ci.md; then echo "ci should block this PR"; exit 1; fi
+          grep -q "BLOCKED=true" ci.env
+          grep -q "Incomplete upgrade set" ci.md
+          $B renovate-config | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const j=JSON.parse(d);if(j.platformAutomerge!==false)throw new Error("renovate-config must disable platform automerge")})' 

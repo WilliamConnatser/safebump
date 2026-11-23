@@ -1,0 +1,8 @@
+# safebump configuration. Docs: https://github.com/WilliamConnatser/safebump
+# No secrets here: credentials come from your CI platform (secrets or OIDC).
+version: 1
+mode: deterministic
+ci:
+  platform: github
+  failOn: blocked
+  coverage: true

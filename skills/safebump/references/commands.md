@@ -6,6 +6,38 @@ Output of `scripts/safebump --help`:
 Usage: safebump <command> [args] [options]
 
 Commands:
+  init                      Set up safebump in this repo: asks a few questions (CI platform, deterministic or AI,
+                            provider, model, agent), writes safebump.yml, the pipeline and renovate.json, and
+                            prints what to configure on the CI platform. Non-interactive with --yes plus
+                            --platform --mode --provider --model --region --project --base-url --agent
+                            [--no-review] [--no-fix]. --write-ci regenerates the pipeline from safebump.yml
+  agent --mode review|fix --base <ref> [--post]
+                            The opt-in AI half (safebump.yml mode: ai). review: the built-in reviewer judges each
+                            change against the APIs this project uses and the release notes, posts its assessment
+                            (can raise risk, never enables auto-merge). fix: --prepare (prompt + base checkout),
+                            --run (the agent CLI, provider from safebump.yml), --finish (re-assure, commit, push,
+                            post); with none of those, all three in order
+  install                   Install the project's dependencies with its package manager (npm ci, pnpm/yarn/bun)
+  ci --base <ref>           Assurance pass for a dependency-update PR (Renovate, Dependabot, manual), no agent:
+                            doctor, what was bumped and from what, complete upgrade set, duplicates, new failures
+                            vs the base-branch baseline, audit, and risk sites proven by tests (runtime coverage).
+                            Verdict low/medium/high or blocked. Exit 1 when blocked, or at/above --fail-on
+                            <medium|high>. --markdown <file> writes the PR comment; --outputs <file> writes
+                            RISK/BLOCKED/NEEDS_AGENT/AGENT_MODE as dotenv (GITHUB_OUTPUT is written automatically);
+                            --skip-coverage skips the test run used for risk sites. --baseline records the
+                            baseline on a checkout of the base branch first (--keep-base <dir> keeps it for fix
+                            mode). --post posts the comment and the safebump / safebump/automerge statuses
+                            (GitHub Actions or GitLab CI). Reads safebump.yml for failOn, coverage, AI mode
+  review-brief --base <ref> | review-brief <pkg> <from> <to>
+                            The review agent's brief: every part of the dependency's API this project uses (incl.
+                            instance methods, option keys, destructured results, JSX props) × what changed in it ×
+                            whether tests run it × release notes for every version crossed. --out <file>
+  usage <pkg>               The parts of a dependency's API this project uses, with call sites
+  release-notes <pkg> <from> <to>
+                            Release notes for every version crossed (GitHub releases, changelog, registry)
+  renovate-config           A renovate.json that cooperates with safebump: package families grouped into one PR
+                            (from source repos / scopes), automerge for patch/minor gated by the
+                            safebump/automerge status, majors always reviewed. Prints JSON
   doctor [pkg[@version]...] Preflight: install matches manifests and lockfile, type checker resolves, tsconfig,
                             git state, Node vs engines (incl. the targets'), duplicate copies; exit 1 on failure
   list                      Major-version upgrades available (all workspaces when run at a workspace root)
@@ -28,8 +60,11 @@ Commands:
   defaults <pkg> [from] [to]
                             Options whose default changed between versions, and the call sites that omit them
                             (so they silently get the new default), with the old value to pin
-  test-gaps <pkg>...        Files using the packages that no test reaches (or only with the package mocked):
-                            where to write characterization tests before upgrading
+  test-gaps <pkg>[@to]...   Code using the packages that tests don't cover. With @to: the call sites the upgrade
+                            is most likely to break (removed/changed APIs, changed defaults; --deprecations adds
+                            deprecated uses), ranked. --coverage runs the project's tests with coverage to show
+                            which sites actually execute. --confirm is the gate before upgrading: every risk site
+                            executed by passing tests on the current version; saves a checkpoint; exit 1 if not
   upstream <pkg> [from] [to]
                             How the package's maintainers changed their own examples, docs and tests between the
                             versions, ranked by the names this project imports (--max-files, --max-lines)
@@ -68,13 +103,14 @@ Options:
 ```
 ## Exit codes
 
-- `tsc`, `verify`, `audit`, `doctor`, `duplicates` and `checkpoint list` exit 1 when they find problems, so they can gate CI and the fix loop.
+- `tsc`, `verify`, `audit`, `doctor`, `duplicates`, `checkpoint list`, `test-gaps --confirm` and `ci` exit 1 when they find problems, so they can gate CI and the fix loop.
 - Every command exits 1 on an operational error, such as a missing type checker or a failed install, with the message on stderr.
 
 ## Files safebump writes
 
 Per project, in `.safebump/`, which ignores itself in git:
 - `baseline.json`: written by `verify baseline`.
+- `coverage-confirmed.json`: written by `test-gaps --confirm`: the risk sites proven executed, and the checkpoint.
 - `progress.md`: the migration log you keep.
 - `migrations/<pkg>/<from>-to-<to>.md`: saved by `notes save`.
 - `codemods/`: your codemod transforms.

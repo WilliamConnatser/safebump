@@ -219,5 +219,14 @@ export const applyUpgrades = async (
       ].join("\n"),
     );
   }
-  return { packageManager, applied, peerWarnings: peerProblems };
+  // a kept "^" lets the package manager resolve something newer than the
+  // version that was planned and analyzed; say so instead of hiding it
+  const resolved = upgrades.map((u) => {
+    const installed = installedVersion(projectRoot, u.packageName);
+    return { packageName: u.packageName, requested: u.newVersion, installed };
+  });
+  const drift = resolved.filter(
+    (r) => r.installed && semver.valid(r.requested) && r.installed !== r.requested,
+  );
+  return { packageManager, applied, peerWarnings: peerProblems, resolved, drift };
 };
