@@ -1,201 +1,133 @@
-<p align="center">
-    <img src="https://github.com/xeol-io/bumpgen/assets/4740147/8abf2d07-6161-42e6-ad4e-2cc9181ad21a" alt="logo"/>
-</p>
+# safebump
 
-<p align="center">
-    <a href="https://www.xeol.io/beta">
-        <img src="https://img.shields.io/badge/Github App Sign Up-FCAE00?logo=googlechrome&logoColor=black&style=for-the-badge"/>
-    </a>
-    <a href="https://github.com/xeol-io/bumpgen?tab=MIT-1-ov-file">
+**Major dependency upgrades your coding agent can prove are safe.**
+
+<p>
+    <a href="./LICENSE">
         <img src="https://img.shields.io/badge/License-MIT-FCAE00.svg?style=for-the-badge">
     </a>
-    <a href="https://github.com/xeol-io/bumpgen/stargazers">
-        <img src="https://img.shields.io/github/stars/xeol-io/bumpgen?color=FCAE00&style=for-the-badge">
-    </a>
-    <a href="https://discord.gg/J7E9BqVHkG">
-        <img src="https://img.shields.io/discord/1233126412785815613?logo=discord&label=discord&color=5865F2&style=for-the-badge"/>
-    </a>
 </p>
 
-## 📝 Summary
+Major upgrades fail in predictable ways:
+- **They break the build.** That part is easy to see.
+- **They need other packages to move too:** peers, plugins, a whole SDK.
+- **They quietly change behavior that still compiles:** a new default, or a flag that kept its name but changed meaning.
 
-`bumpgen` bumps your **TypeScript / TSX** dependencies and makes code changes for you if anything breaks.
+safebump is an agent skill for **TypeScript / TSX** projects that handles all three. It plans every package that has to move together and uses the framework's own migration tool when there is one. It fixes the breakage in dependency order, then proves the result:
+- no new failing tests, lint or build errors against a baseline taken before the upgrade
+- no casts or suppressions papering over errors
+- every changed default either pinned to the old value or deliberately accepted
 
-![demo](<https://assets-global.website-files.com/65af8f02f12662528cdc93d6/662e6061d42954630a191417_tanstack-ezgif.com-speed%20(1).gif>)
+It follows the open [Agent Skills](https://agentskills.io) format, so it runs in any agent that loads `SKILL.md` skills: Claude Code, Codex, Gemini CLI, Cursor, GitHub Copilot, OpenCode and others. It works on the subscription you already have; no separate LLM API key is needed.
 
-Here's a common scenario:
+## 🚀 Install
 
-> you: "I should upgrade to the latest version of x, it has banging new features and impressive performance improvements"
->
-> you (5 minutes later): _nevermind, that broke a bunch of stuff_
+With the cross-agent [skills CLI](https://github.com/vercel-labs/skills), which asks which agents to install into:
 
-Then use `bumpgen`!
-
-**How does it work?**
-
-- `bumpgen` builds your project to understand what broke when a dependency was bumped
-- Then `bumpgen` uses [ts-morph](https://github.com/dsherret/ts-morph) to create an _abstract syntax tree_ from your code, to understand the relationships between statements
-- It also uses the AST to get type definitions for external methods to understand how to use new package versions
-- `bumpgen` then creates a _plan graph_ DAG to execute things in the correct order to handle propagating changes (ref: [arxiv 2309.12499](https://huggingface.co/papers/2309.12499))
-
-> [!NOTE]
-> `bumpgen` only supports typescript and tsx at the moment, but we're working on adding support for other strongly typed languages. Hit the emoji button on our open issues for [Java](https://github.com/xeol-io/bumpgen/issues/60), [golang](https://github.com/xeol-io/bumpgen/issues/59), [C#](https://github.com/xeol-io/bumpgen/issues/62) and [Python](https://github.com/xeol-io/bumpgen/issues/61) to request support.
-
-## 🚀 Get Started
-
-To get started, you'll need an OpenAI API key. `gpt-4-turbo-preview` from OpenAI is the only supported model at this time, though we plan on supporting more soon.
-
-Then, run `bumpgen`:
-
-```
-> export LLM_API_KEY="<openai-api-key>"
-> cd ~/my-repository
-> npm install -g bumpgen
-> bumpgen @tanstack/react-query 5.28.14
+```bash
+npx skills add WilliamConnatser/safebump
 ```
 
-where `@tanstack/react-query` is the package you want to bump and `5.28.14` is the version you want to bump to.
+Add `-g` to install for your user instead of the current project.
 
-You can also run `bumpgen` without arguments and select which package to upgrade from the menu. Use `bumpgen --help` for a complete list of options.
+Or by hand: clone the repo and link `skills/safebump` into your agent's skills directory.
 
-### Github Action
+| Agent | Directory |
+|---|---|
+| Codex, Gemini CLI, Cursor, Copilot and others | `.agents/skills/` (project) or `~/.agents/skills/` (user) |
+| Claude Code | `.claude/skills/` or `~/.claude/skills/`. This repo is also a Claude Code plugin marketplace: `/plugin marketplace add WilliamConnatser/safebump` |
 
-We've created a GitHub action that can be used to run bumpgen. The intended usage is to be triggered on dependabot or renovatebot PRs - if breaking changes are detected, bumpgen will commit to the PR branch.
-
-> [!NOTE]
-> The action commits changes to the branch it was triggered from. If you would like those commits to trigger other CI workflows, you will need to use a GitHub [Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
-
-#### Example Workflow
-
-```yml
-name: "Bumpgen"
-
-on:
-  pull_request:
-    types:
-      - opened
-
-permissions:
-  pull-requests: read
-  contents: write
-
-jobs:
-  main:
-    name: Run Bumpgen
-    runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]'}} # Use renovate[bot] for renovate PRs
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup # Checkout and setup your project before running the bumpgen action
-        uses: ./tooling/github/setup
-      - name: Bumpgen
-        uses: xeol-io/bumpgen@v0.0.1
-        with:
-          path: "./packages/bumpgen-core/" # The location of your project's package.json file
-          llm_key: ${{ secrets.LLM_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+```bash
+git clone https://github.com/WilliamConnatser/safebump.git
+ln -s "$PWD/safebump/skills/safebump" ~/.agents/skills/safebump
 ```
 
-> [!NOTE]
-> If you'd like to be first in line to try the `bumpgen` GitHub App to replace your usage of dependabot + renovatebot, sign up [here](https://www.xeol.io/beta).
+Then ask:
+
+> upgrade @tanstack/react-query to v5
+
+Or ask _"what major upgrades are available?"_, or on a dependency-update PR's branch, _"fix this upgrade"_.
+
+The skill is self-contained: one minified script bundle, nothing to install and no dependencies added to your project. It needs Node 20+ and git.
+
+To roll it out to a team, and to run it automatically in CI on dependency PRs from any bot or person with any agent CLI, see [examples/react-query-v4](examples/react-query-v4). It is a small project that breaks on upgrade, and it contains a GitHub workflow to copy.
+
+## ⚙️ How it works
+
+The agent does the reading, reasoning and editing. The [CLI](cli/src) (shipped as one bundled script) does the deterministic analysis an agent can't cheaply do by hand. There are commands for each stage of an upgrade.
+
+**Choose what to upgrade**
+- `fleet` splits every pending upgrade into sequenced branches, safest first. For example, react-query 5, then react 19 on top of it.
+- `impact <pkg>` estimates the blast radius before anything is installed: files touched, removed APIs in use, behavior changes and a risk level.
+
+**Preflight**
+- `doctor` checks that the install matches the manifests and lockfile, the type checker resolves, Node meets every target's `engines`, and there are no duplicate copies. Errors from a broken setup look like upgrade breakage, so this runs first.
+
+**Plan**
+- `plan <pkg>` builds the full **upgrade set**:
+  - peers the new versions require
+  - installed packages whose peer ranges would break
+  - siblings released in lockstep (`@angular/*`)
+  - matching `@types`
+  - conflicts that have no solution
+- `api-diff <pkg>` shows what changed **in the APIs this project uses**, including changed `@default` values and deprecations. This is how changes that compile but behave differently get caught.
+- `notes <pkg>` returns cached migration notes.
+- `upstream <pkg>` shows how the package's maintainers changed their own examples, docs and tests between the two versions, which is real before/after code.
+- `plan` lists official migration tools (`expo install --fix`, `ng update`, Tamagui's `migrate`…) from a vetted registry, plus any discovered codemods.
+
+**Prepare on the old version**
+- `test-gaps <pkg>` lists the code that uses the package but that no test reaches. The agent writes characterization tests there first; they must pass before and after the upgrade.
+- `deprecations <pkg>`: on the latest release of the current major, uses of `@deprecated` APIs get fixed first. The major bump then breaks far less.
+
+**Fix**
+- `errors <pkg>...` maps type errors to code blocks. It orders them by dependency, groups files into waves that subagents can fix in parallel, and flags repeated errors.
+- `codemod` applies one mechanical change across a large codebase, with a dry run first.
+- `refs` follows a changed signature to its callers.
+- `checkpoint` snapshots each round with its error count and audit findings. When a round regresses, stalls or hides errors, the agent restores the best snapshot instead of leaving a half-migrated tree.
+
+**Check**
+- `verify` re-runs the type check, tests, lint and build, and reports only **new** failures compared with a baseline taken before the upgrade.
+- `defaults <pkg>` lists the call sites that silently pick up a changed default, with the old value to pin.
+- `duplicates <pkg>` catches packages installed in two versions after the upgrade.
+- `audit` fails on added casts, `@ts-ignore`, lint suppressions, weakened tests or a loosened tsconfig.
+
+**Ship**
+- `report` writes a PR description: a version table, checks, and sections for the agent to fill in.
+- `.safebump/progress.md` lets a long migration resume in a later session, or in a different agent.
+
+**Detected, not assumed**
+- **Type checker:** the project's `typecheck` script, otherwise [ts-rust](https://github.com/pingdotgg/ts-rust) (`tsc-rs`), tsgo, `vue-tsc` or `tsc`.
+- **Package manager:** npm, pnpm, yarn or Bun.
+- **Monorepo setup:** workspaces and TypeScript project references.
+
+[SKILL.md](skills/safebump/SKILL.md) runs the process: plan → baseline → research (subagents with [research-migration.md](skills/safebump/references/research-migration.md)) → upgrade or the official migration tool → fix in waves (subagents with [fix-errors.md](skills/safebump/references/fix-errors.md)) → verify and audit → report. Large migrations go one major at a time.
+
+The ordering idea comes from **[CodePlan](https://huggingface.co/papers/2309.12499)**: fix a change at its source first, then follow it to the code that depends on it. The AST work uses **[ts-morph](https://github.com/dsherret/ts-morph)**.
+
+## 📊 Evals
+
+[`evals/`](evals) measures the skill end to end, on any agent:
+- It runs [swe-bump-bench](https://github.com/xeol-io/swe-bump-bench) (62 real upgrade tasks) or local tasks.
+- It scores each run deterministically: is the target version installed, does it type-check clean, does `verify` report no new failures, and is `audit` clean.
+- `compare` shows score changes between runs, including against the original CLI's 45%.
+
+Start with a single task. A full run costs real tokens. See the [evals README](evals/README.md).
 
 ## Limitations
 
-There are some limitations you should know about.
+- It only supports TypeScript and TSX. The type checker must print tsc-style diagnostics, which tsc, tsgo, ts-rust and vue-tsc all do.
+- `plan` resolves the peer ranges declared on the registry. Constraints that live only in docs are left to the agent's migration research, which reads the guide. An example is "upgrade the CLI with the framework".
+- Very large framework migrations, such as Vue 2 → 3, are still arduous. Expect to steer, and commit between majors.
 
-- `bumpgen` relies on build errors to determine what needs to be fixed. If an issue is caused by a behavioral change, `bumpgen` won't detect it.
-- `bumpgen` can't handle multiple packages at the same time. It will fail to upgrade packages that require peer dependencies to be updated the same time to work such as `@octokit/core` and `@octokit/plugin-retry`.
-- `bumpgen` is not good with very large frameworks like `vue`. These kind of upgrades (and vue 2 -> 3 specifically) can be arduous even for a human.
+## 📜 Credits and license
 
-## 🏙️ Architecture
+safebump is derived from [bumpgen](https://github.com/xeol-io/bumpgen) by [Xeol](https://github.com/xeol-io), released under the MIT license. bumpgen was a CLI and GitHub Action that called the OpenAI API directly, one code block at a time. It scored 45% on [swe-bump-bench](https://github.com/xeol-io/swe-bump-bench) with GPT-4 Turbo.
 
-```
- > bumpgen @tanstack/react-query 5.28.14
-       │
-┌┬─────▼──────────────────────────────────────────────────────────────────────┐
-││ CLI                                                                        │
-└┴─────┬──▲───────────────────────────────────────────────────────────────────┘
-       │  │
-┌┬─────▼──┴───────────────────────────────────────────────────────────────────┐
-││ Core (Codeplan)                                                            │
-││                                                                            │
-││ ┌───────────────────────────────────┐ ┌──────────────────────────────────┐ │
-││ │ Plan Graph                        │ │ Abstract Syntax Tree             │ │
-││ │                                   │ │                                  │ │
-││ │                                   │ │                                  │ │
-││ │               ┌─┐                 │ │                  ┌─┐             │ │
-││ │            ┌──┴─┘                 │ │               ┌──┴─┴──┐          │ │
-││ │            │                      │ │               │       │          │ │
-││ │           ┌▼┐                  ┌──┼─┼──┐           ┌▼┐     ┌▼┐         │ │
-││ │           └─┴──┐               │  │ │  │        ┌──┴─┴──┐  └─┘         │ │
-││ │                │                  │ │  ▼        │       │              │ │
-││ │               ┌▼┐              ▲  │ │          ┌▼┐     ┌▼┐             │ │
-││ │               └─┴──┐           │  │ │  │       └─┘  ┌──┴─┴──┐          │ │
-││ │                    │           └──┼─┼──┘            │       │          │ │
-││ │                   ┌▼┐             │ │              ┌▼┐     ┌▼┐         │ │
-││ │                   └─┘             │ │              └─┘     └─┘         │ │
-││ │                                   │ │                                  │ │
-││ │                                   │ │                                  │ │
-││ │                                   │ │                                  │ │
-││ │                                   │ │                                  │ │
-││ └───────────────────────────────────┘ └──────────────────────────────────┘ │
-││                                                                            │
-└┴─────┬──▲───────────────────────────────────────────────────────────────────┘
-       │  │
-┌┬─────▼──┴───────────────────────────┐  ┌┬───────────────────────────────────┐
-││ Prompt Context                     │  ││ LLM                               │
-││                                    │  ││                                   │
-││ - plan graph                       │  ││ GPT4-Turbo, Claude 3, BYOM        │
-││ - errors                           ├──►│                                   │
-││ - code                             │  ││                                   │
-││                                    ◄──┼│                                   │
-││                                    │  ││                                   │
-││                                    │  ││                                   │
-││                                    │  ││                                   │
-└┴────────────────────────────────────┘  └┴───────────────────────────────────┘
-```
+What safebump keeps from it:
+- the idea of fixing breakage in dependency order, from [CodePlan](https://huggingface.co/papers/2309.12499)
+- the ts-morph analysis of code blocks and imports
+- the type-checker output parsing
 
-#### Abstract Syntax Tree
+Everything else is new: running as an agent skill, upgrade-set planning, migration tools, API and default diffs, verification against a baseline, audits, checkpoints, fleet mode and the eval harness.
 
-The AST is generated from **[ts-morph](https://github.com/dsherret/ts-morph)**. This AST allows `bumpgen` to understand the relationship between nodes in a codebase.
-
-#### Plan Graph
-
-The plan graph is a concept detailed in **[codeplan](https://huggingface.co/papers/2309.12499)** by Microsoft. The plan graph allows `bumpgen` to not only fix an issue at a point but also fix the 2nd order breaking changes from the fix itself. In short, it allows `bumpgen` to propagate a fix to the rest of the codebase.
-
-#### Prompt Context
-
-We pass the plan graph, the error, and the actual file with the breaking change as context to the LLM to maximize its ability to fix the issue.
-
-#### LLM
-
-We only support `gpt-4-turbo-preview` at this time.
-
-<p align="center">
-    <img src="https://s3.amazonaws.com/static.xeol.io/memes/terminator-meme.png" alt="meme"/>
-</p>
-
-## ⏱️ Benchmark
-
-```
-bumpgen + GPT-4 Turbo         ██████████░░░░░░░░░░░   45% (67 tasks)
-```
-
-We benchmarked `bumpgen` with GPT-4 Turbo against a [suite](https://github.com/xeol-io/swe-bump-bench) of version bumps with breaking changes. You can check out the evals [here](https://github.com/xeol-io/swe-bump-bench/tree/main/evals/bumpgen/v_8df9f7de936707815eb12e226517a1b0023383eb).
-
-## 🎁 Contributing
-
-Contributions are welcome! To get set up for development, see [Development](./.github/development.md).
-
-#### Roadmap
-
-- [x] codeplan
-- [x] Typescript/TSX support
-- [ ] `bumpgen` GitHub app
-- [ ] Embeddings for different package versions
-- [ ] Use test runners as an oracle
-- [ ] C# support
-- [ ] Java support
-- [ ] Go support
-
-[Join](https://discord.gg/J7E9BqVHkG) our Discord community to contribute, learn more, and ask questions!
+safebump is MIT-licensed. The [LICENSE](LICENSE) keeps Xeol's original copyright notice alongside the new one, as the MIT license requires for derived work.
