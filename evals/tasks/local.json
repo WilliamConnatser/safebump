@@ -1,0 +1,10 @@
+[
+  {
+    "id": "local__react-query-v4-@tanstack-slash-react-query__5.59.0",
+    "path": "../../examples/react-query-v4",
+    "pkgManager": "npm",
+    "package": "@tanstack/react-query",
+    "versionTo": "5.59.0",
+    "nodeVersion": "22"
+  }
+]

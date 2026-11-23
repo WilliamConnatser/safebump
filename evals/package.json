@@ -1,0 +1,19 @@
+{
+  "name": "safebump-evals",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Outcome evals for the safebump skill across agent CLIs (swe-bump-bench + local tasks)",
+  "scripts": {
+    "eval": "tsx run.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
