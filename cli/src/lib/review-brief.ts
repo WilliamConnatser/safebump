@@ -48,8 +48,10 @@ const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s
 const changesFor = (use: ApiUse, symbols: SymbolDiff[]) => {
   const out: string[] = [];
   for (const s of symbols) {
-    // a top-level export used directly
-    if (!use.owner && s.name === use.api) {
+    // a top-level export used directly; api-diff names a default import
+    // "default", the usage map by its declared name (OpenAI)
+    const isDefault = s.name === "default" && !use.owner && !symbols.some((x) => x.name === use.api);
+    if (!use.owner && (s.name === use.api || isDefault)) {
       if (s.status === "removed") out.push("export removed");
       if (s.signatureChanged) out.push("signature changed");
       if (s.deprecated) out.push(`deprecated: ${clip(s.deprecated, 100)}`);

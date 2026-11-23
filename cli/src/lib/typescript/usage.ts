@@ -116,9 +116,8 @@ type Ctx = {
   family: Set<string>;
   // every name the package's declarations declare
   names: Set<string>;
-  // and the TypeScript lib's (push, set, from: containers options pass through)
+  // and the TypeScript lib's (push, set: containers options pass through)
   libNames: Set<string>;
-  program: ts.Program;
   uses: Map<string, Draft>;
 };
 
@@ -160,7 +159,7 @@ const record = (
 };
 
 const declsOf = (ctx: Ctx, s: ts.Symbol | undefined) =>
-  s ? resolveAlias(ctx.checker, s).getDeclarations() ?? [] : [];
+  s ? (resolveAlias(ctx.checker, s).getDeclarations() ?? []) : [];
 
 const familyDecls = (ctx: Ctx, s: ts.Symbol | undefined) =>
   declsOf(ctx, s).filter((d) => isFamilyFile(ctx.family, d.getSourceFile().fileName));
@@ -200,7 +199,7 @@ const recordMember = (
   }
   const via = typeName(ctx, receiver());
   const owner = via && owners.includes(via) ? via : owners[0]!;
-  const name = owners.length === 1 ? owner : via ?? owner;
+  const name = owners.length === 1 ? owner : (via ?? owner);
   record(ctx, { api: `${name}.${member}`, owner, owners, via, member, declaredIn }, kind, site);
   return true;
 };
@@ -209,34 +208,34 @@ const recordMember = (
 // unions only expose properties every member shares
 const propertiesOf = (ctx: Ctx, type: ts.Type | undefined, name: string) => {
   if (!type) return [];
-  const t = ctx.checker.getNonNullableType(type);
+  let t = ctx.checker.getNonNullableType(type);
+  // generic options (`options: TOptions`) are read through their constraint
+  if (t.flags & ts.TypeFlags.TypeParameter) t = ctx.checker.getBaseConstraintOfType(t) ?? t;
   const direct = t.getProperty(name);
   if (direct || !t.isUnion()) return [direct];
   return t.types.map((m) => ctx.checker.getNonNullableType(m).getProperty(name));
 };
 
-// ---- which object literals can be the package's options ----
+// ---- the types option objects are written against ----
 
-// Typing an object literal's context means resolving the call it's passed
-// to, which can cost seconds on heavy types, so only literals that can reach
-// the package are typed: arguments of its functions (or of lib containers
-// like push, or of project functions whose parameter is annotated with its
-// types), values annotated with its types, and props of its components.
-// Options passed through unannotated project helpers are missed.
+// What an object literal or JSX element is checked against, from declared
+// types only: the callee's parameter, the component's props, an annotation,
+// walked down through nested keys and array elements. Not the checker's
+// contextual type: that resolves the whole call or element, typing every
+// argument, which costs minutes on heavy types (tRPC, tamagui). Literals
+// passed to unannotated project helpers have no declared target and are
+// missed; generic parameters are read through their constraint.
 
-const referencesFamily = (ctx: Ctx, type: ts.TypeNode | undefined): boolean => {
-  if (!type) return false;
+// whether a type annotation names one of the package's types (by symbol,
+// which is cheap; typing the annotation may not be)
+const mentionsFamily = (ctx: Ctx, type: ts.TypeNode) => {
   let found = false;
   const visit = (n: ts.Node): void => {
     if (found) return;
-    const name = ts.isTypeReferenceNode(n) ? n.typeName : ts.isExpressionWithTypeArguments(n) ? n.expression : undefined;
-    if (name) {
-      const last = ts.isQualifiedName(name) ? name.right : ts.isPropertyAccessExpression(name) ? name.name : name;
-      if (familyDecls(ctx, ctx.checker.getSymbolAtLocation(last)).length > 0) found = true;
-    }
-    if (ts.isImportTypeNode(n) && ts.isLiteralTypeNode(n.argument) && ts.isStringLiteral(n.argument.literal)) {
-      const p = packageOf(n.argument.literal.text);
-      if (ctx.family.has(p)) found = true;
+    if (ts.isIdentifier(n) && ctx.names.has(n.text)) {
+      found = familyDecls(ctx, ctx.checker.getSymbolAtLocation(n)).length > 0;
+    } else if (ts.isImportTypeNode(n) && ts.isLiteralTypeNode(n.argument) && ts.isStringLiteral(n.argument.literal)) {
+      found = ctx.family.has(packageOf(n.argument.literal.text));
     }
     ts.forEachChild(n, visit);
   };
@@ -244,71 +243,146 @@ const referencesFamily = (ctx: Ctx, type: ts.TypeNode | undefined): boolean => {
   return found;
 };
 
-const calleeName = (e: ts.Expression) =>
-  ts.isIdentifier(e) ? e : ts.isPropertyAccessExpression(e) ? e.name : undefined;
+type Carries = (receiver: ts.Node) => boolean;
 
-const acceptsFamilyArgument = (ctx: Ctx, call: ts.CallExpression | ts.NewExpression, index: number) => {
-  const name = calleeName(call.expression);
-  if (!name) return false;
-  // a property callee is resolved by typing its receiver: only names that
-  // can be the package's or the lib's are worth it
-  if (ts.isPropertyAccessExpression(call.expression) && !ctx.names.has(name.text) && !ctx.libNames.has(name.text)) {
-    return false;
-  }
-  return declsOf(ctx, ctx.checker.getSymbolAtLocation(name)).some((d) => {
-    const file = d.getSourceFile();
-    if (isFamilyFile(ctx.family, file.fileName) || ctx.program.isSourceFileDefaultLibrary(file)) return true;
-    if (file.fileName.includes("/node_modules/")) return false;
-    const fn = ts.isVariableDeclaration(d) && d.initializer ? d.initializer : d;
-    if (!ts.isFunctionLike(fn)) return false;
-    const param = fn.parameters[Math.min(index, fn.parameters.length - 1)];
-    return !!param && referencesFamily(ctx, param.type);
-  });
-};
+const makeExpected = (ctx: Ctx, carries: Carries) => {
+  const { checker } = ctx;
+  const memo = new Map<ts.Node, ts.Type[]>();
+  const constraint = (t: ts.Type) =>
+    t.flags & ts.TypeFlags.TypeParameter ? (checker.getBaseConstraintOfType(t) ?? t) : t;
+  const parts = (t: ts.Type) => {
+    const n = constraint(checker.getNonNullableType(t));
+    return n.isUnion() ? n.types : [n];
+  };
+  // annotations are only typed when they name something of the package:
+  // `Record<RouterOutputs["x"]["status"], ColorTokens>` alone can take minutes
+  const annotated = (type: ts.TypeNode | undefined) => {
+    if (!type || !mentionsFamily(ctx, type)) return [];
+    return [checker.getTypeFromTypeNode(type)];
+  };
+  const propType = (types: ts.Type[], name: string) =>
+    types.flatMap(parts).flatMap((t) => {
+      const p = t.getProperty(name);
+      return p ? [checker.getTypeOfSymbol(p)] : [];
+    });
 
-const isFamilyComponent = (ctx: Ctx, tag: ts.JsxTagNameExpression) => {
-  const name = ts.isIdentifier(tag) ? tag : ts.isPropertyAccessExpression(tag) ? tag.name : undefined;
-  if (!name || (ts.isPropertyAccessExpression(tag) && !ctx.names.has(name.text))) return false;
-  return familyDecls(ctx, ctx.checker.getSymbolAtLocation(name)).length > 0;
-};
-
-const functionReturns = (ctx: Ctx, fn: ts.SignatureDeclaration): boolean | ts.Node =>
-  fn.type ? referencesFamily(ctx, fn.type) : ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) ? fn : false;
-
-// climbs from a literal through enclosing literals, spreads, conditionals
-// and callbacks to whatever gives it its type
-const isAnchored = (ctx: Ctx, literal: ts.Node): boolean => {
-  let n = literal;
-  for (;;) {
-    const p = n.parent;
-    if (
-      ts.isPropertyAssignment(p) || ts.isSpreadAssignment(p) || ts.isSpreadElement(p) ||
-      ts.isObjectLiteralExpression(p) || ts.isArrayLiteralExpression(p) || ts.isParenthesizedExpression(p) ||
-      ts.isNonNullExpression(p) || ts.isConditionalExpression(p) ||
-      (ts.isBinaryExpression(p) && p.right === n && p.operatorToken.kind !== ts.SyntaxKind.EqualsToken)
-    ) {
-      n = p;
-      continue;
+  // a callee's type, when it's cheap: declared functions and classes, and
+  // package and lib methods on receivers that can hold the package's values
+  const calleeType = (callee: ts.Expression): ts.Type | undefined => {
+    if (ts.isPropertyAccessExpression(callee)) {
+      const name = callee.name.text;
+      if ((!ctx.names.has(name) && !ctx.libNames.has(name)) || !carries(callee.expression)) return undefined;
+      return checker.getTypeAtLocation(callee);
     }
-    if (ts.isAsExpression(p) || ts.isSatisfiesExpression(p)) return referencesFamily(ctx, p.type);
+    if (!ts.isIdentifier(callee)) return undefined;
+    const s = checker.getSymbolAtLocation(callee);
+    const target = s && resolveAlias(checker, s);
+    const decl = target?.declarations?.[0];
+    if (!target || !decl) return undefined;
+    if (decl.getSourceFile().isDeclarationFile) return checker.getTypeOfSymbol(target);
+    // project functions: only when a parameter is annotated with the
+    // package's types, and never inferred locals (`const f = useCallback(...)`
+    // types the whole callback)
+    const fn = ts.isVariableDeclaration(decl) ? decl.initializer : decl;
+    const params =
+      fn &&
+      (ts.isFunctionLike(fn)
+        ? fn.parameters
+        : ts.isClassDeclaration(fn)
+          ? fn.members.find(ts.isConstructorDeclaration)?.parameters
+          : undefined);
+    return params?.some((p) => p.type && mentionsFamily(ctx, p.type)) ? checker.getTypeOfSymbol(target) : undefined;
+  };
+
+  const parameterTypes = (callee: ts.Expression, index: number, construct: boolean) => {
+    const t = calleeType(callee);
+    if (!t) return [];
+    return parts(t)
+      .flatMap((x) => (construct ? x.getConstructSignatures() : x.getCallSignatures()))
+      .flatMap((sig) => {
+        const params = sig.getParameters();
+        const p = params[Math.min(index, params.length - 1)];
+        if (!p) return [];
+        const decl = p.valueDeclaration;
+        if (decl && ts.isParameter(decl) && !decl.getSourceFile().isDeclarationFile && !annotated(decl.type).length)
+          return [];
+        const pt = checker.getTypeOfSymbol(p);
+        const rest = !!decl && ts.isParameter(decl) && !!decl.dotDotDotToken;
+        const el = rest ? checker.getIndexTypeOfType(pt, ts.IndexKind.Number) : pt;
+        return el ? [el] : [];
+      });
+  };
+
+  // function components' first parameter; class components' constructor's
+  const propsOf = (tag: ts.JsxTagNameExpression) => {
+    if (!ts.isIdentifier(tag) && !ts.isPropertyAccessExpression(tag)) return [];
+    return [...parameterTypes(tag, 0, false), ...parameterTypes(tag, 0, true)];
+  };
+
+  const returnTypes = (fn: ts.SignatureDeclaration): ts.Type[] =>
+    fn.type
+      ? annotated(fn.type)
+      : ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)
+        ? expected(fn)
+            .flatMap(parts)
+            .flatMap((t) => t.getCallSignatures().map((sig) => sig.getReturnType()))
+        : [];
+
+  const compute = (n: ts.Node): ts.Type[] => {
+    if (ts.isJsxAttributes(n)) return propsOf(n.parent.tagName);
+    const p = n.parent;
+    if (ts.isPropertyAssignment(p) && p.initializer === n) {
+      const name = nameText(p.name);
+      return name === undefined ? [] : propType(expected(p.parent), name);
+    }
     if (ts.isJsxExpression(p)) {
       const attr = p.parent;
-      return ts.isJsxAttribute(attr) && isFamilyComponent(ctx, attr.parent.parent.tagName);
+      const name = ts.isJsxAttribute(attr) ? nameText(attr.name) : undefined;
+      return name === undefined ? [] : propType(expected(attr.parent), name);
+    }
+    if (
+      ts.isParenthesizedExpression(p) ||
+      ts.isNonNullExpression(p) ||
+      ts.isSpreadElement(p) ||
+      (ts.isConditionalExpression(p) && p.condition !== n) ||
+      (ts.isBinaryExpression(p) && p.right === n && p.operatorToken.kind !== ts.SyntaxKind.EqualsToken)
+    ) {
+      return expected(p);
+    }
+    // { ...cond ? { a } : {} } is checked against the enclosing literal's type
+    if (ts.isSpreadAssignment(p)) return expected(p.parent);
+    if (ts.isArrayLiteralExpression(p)) {
+      return expected(p)
+        .flatMap(parts)
+        .flatMap((t) => checker.getIndexTypeOfType(t, ts.IndexKind.Number) ?? []);
     }
     if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression !== n) {
-      return acceptsFamilyArgument(ctx, p, p.arguments?.indexOf(n as ts.Expression) ?? 0);
+      return parameterTypes(p.expression, p.arguments?.indexOf(n as ts.Expression) ?? 0, ts.isNewExpression(p));
     }
     if ((ts.isVariableDeclaration(p) || ts.isPropertyDeclaration(p) || ts.isParameter(p)) && p.initializer === n) {
-      return referencesFamily(ctx, p.type);
+      return annotated(p.type);
     }
-    const fn = ts.isReturnStatement(p)
-      ? (ts.findAncestor(p, ts.isFunctionLike) as ts.SignatureDeclaration | undefined)
-      : ts.isArrowFunction(p) && p.body === n ? p : undefined;
-    if (!fn) return false;
-    const r = functionReturns(ctx, fn);
-    if (typeof r === "boolean") return r;
-    n = r;
-  }
+    if (ts.isAsExpression(p) || ts.isSatisfiesExpression(p)) {
+      return ts.isConstTypeReference(p.type) ? expected(p) : annotated(p.type);
+    }
+    if (ts.isReturnStatement(p)) {
+      const fn = ts.findAncestor(p, ts.isFunctionLike) as ts.SignatureDeclaration | undefined;
+      return fn ? returnTypes(fn) : [];
+    }
+    if (ts.isArrowFunction(p) && p.body === n) return returnTypes(p);
+    return [];
+  };
+
+  const expected = (n: ts.Node): ts.Type[] => {
+    let types = memo.get(n);
+    if (!types) {
+      memo.set(n, []); // cycles
+      types = compute(n);
+      memo.set(n, types);
+    }
+    return types;
+  };
+  return expected;
 };
 
 // how an expression in callee/tag position is used
@@ -329,8 +403,10 @@ const isTypePosition = (id: ts.Node) => {
   if (ts.isTypeReferenceNode(p) || ts.isTypeQueryNode(p) || ts.isImportTypeNode(p)) return true;
   if (ts.isExpressionWithTypeArguments(p)) {
     const clause = p.parent;
-    return ts.isHeritageClause(clause) &&
-      (clause.token === ts.SyntaxKind.ImplementsKeyword || ts.isInterfaceDeclaration(clause.parent));
+    return (
+      ts.isHeritageClause(clause) &&
+      (clause.token === ts.SyntaxKind.ImplementsKeyword || ts.isInterfaceDeclaration(clause.parent))
+    );
   }
   return false;
 };
@@ -356,9 +432,10 @@ const importsOf = (ctx: Ctx, sf: ts.SourceFile, pkg: string, lineOf: (n: ts.Node
     const decl = target?.getDeclarations()?.[0];
     let api = fallback;
     if (fallback === "default" && target) {
-      api = target.name !== "default" && target.name !== "export="
-        ? target.name
-        : nameText((decl as ts.NamedDeclaration | undefined)?.name) ?? local.text;
+      api =
+        target.name !== "default" && target.name !== "export="
+          ? target.name
+          : (nameText((decl as ts.NamedDeclaration | undefined)?.name) ?? local.text);
     }
     const declaredIn = (decl && packageFromPath(decl.getSourceFile().fileName)) ?? pkg;
     return { api, declaredIn: ctx.family.has(declaredIn) ? declaredIn : pkg };
@@ -368,10 +445,17 @@ const importsOf = (ctx: Ctx, sf: ts.SourceFile, pkg: string, lineOf: (n: ts.Node
     if (!isFromPackage(st.moduleSpecifier.text, pkg) || !st.importClause) continue;
     const line = lineOf(st);
     const clause = st.importClause;
-    if (clause.name) locals.set(clause.name.text, { ...resolved(clause.name, "default"), line, used: false, ns: false });
+    if (clause.name)
+      locals.set(clause.name.text, { ...resolved(clause.name, "default"), line, used: false, ns: false });
     const bindings = clause.namedBindings;
     if (bindings && ts.isNamespaceImport(bindings)) {
-      locals.set(bindings.name.text, { api: `* as ${bindings.name.text}`, declaredIn: pkg, line, used: false, ns: true });
+      locals.set(bindings.name.text, {
+        api: `* as ${bindings.name.text}`,
+        declaredIn: pkg,
+        line,
+        used: false,
+        ns: true,
+      });
     } else if (bindings) {
       for (const el of bindings.elements) {
         const imported = (el.propertyName ?? el.name).text;
@@ -384,98 +468,254 @@ const importsOf = (ctx: Ctx, sf: ts.SourceFile, pkg: string, lineOf: (n: ts.Node
 
 // ---- which receivers can hold the package's objects ----
 
-// Resolving `x.data` types `x`, which is where the cost is, so members are
-// only resolved on expressions that mention a name that can carry the
-// package's values: its imports, imports from project files that use it
-// (useUser wrapping useQuery), and, to a fixpoint, variables, parameters
-// and functions whose type or initializer mentions one of those, and
-// callback parameters of calls that do. Purely syntactic and generous;
-// values reaching the file any other way are missed.
+// Resolving `x.data` types `x`, which is where the cost is (a tRPC router
+// took 100 s on its first touch), so members are only resolved on receivers
+// rooted in a variable that can hold the package's values: its imports,
+// imports of project functions that use it (useUser wrapping useQuery), and,
+// to a fixpoint, variables, parameters and functions whose annotation or
+// value flows from one of those, and callback parameters of calls on one.
+// Tracked by symbol, so a callback's `r` isn't every `r` in the file.
+// Values reaching the file any other way (untyped helpers in other files,
+// globals) are missed.
 
-const IDENT = /[A-Za-z_$][\w$]*/g;
-const tokens = (text: string) => new Set(text.match(IDENT) ?? []);
+// the identifiers a value can come from: `x.y`, `f(x)`, `c ? x : y`,
+// `x ?? y`, what callbacks return; not what comparisons, arithmetic or
+// templates produce (`mode === "PROFILE"` is a boolean, whatever mode is)
+//
+// A call's arguments only count when the callee is a library function or
+// method (useMemo(() => x), Effect.tryPromise({ try: ... })): a project hook
+// or a method on a local object (trpc.x.queryOptions(input)) returns
+// something of its own, and typing it can be what's expensive.
+const makeFlow = (checker: ts.TypeChecker) => {
+  const passesArguments = (callee: ts.Expression) => {
+    if (ts.isIdentifier(callee)) {
+      // a library function or an adapter parameter (Effect.gen's `_`), not a
+      // project hook, which returns its own thing
+      const s = checker.getSymbolAtLocation(callee);
+      const decl = (s && resolveAlias(checker, s))?.declarations?.[0];
+      return !!decl && (decl.getSourceFile().isDeclarationFile || (ts.isParameter(decl) && !decl.type));
+    }
+    let root: ts.Expression = callee;
+    while (ts.isPropertyAccessExpression(root)) root = root.expression;
+    if (!ts.isIdentifier(root)) return false;
+    const decl = checker.getSymbolAtLocation(root)?.declarations?.[0];
+    return (
+      !!decl &&
+      (decl.getSourceFile().isDeclarationFile ||
+        ts.isImportSpecifier(decl) ||
+        ts.isNamespaceImport(decl) ||
+        ts.isImportClause(decl))
+    );
+  };
 
-const boundNames = (name: ts.BindingName, out: string[] = []) => {
-  if (ts.isIdentifier(name)) out.push(name.text);
-  else for (const el of name.elements) if (!ts.isOmittedExpression(el)) boundNames(el.name, out);
+  const flowIds = (e: ts.Node | undefined, out: ts.Identifier[] = []): ts.Identifier[] => {
+    if (!e) return out;
+    if (ts.isIdentifier(e)) out.push(e);
+    else if (
+      ts.isPropertyAccessExpression(e) ||
+      ts.isElementAccessExpression(e) ||
+      ts.isParenthesizedExpression(e) ||
+      ts.isNonNullExpression(e) ||
+      ts.isAwaitExpression(e) ||
+      ts.isAsExpression(e) ||
+      ts.isSatisfiesExpression(e) ||
+      ts.isTypeAssertionExpression(e) ||
+      ts.isSpreadElement(e) ||
+      ts.isSpreadAssignment(e) ||
+      ts.isYieldExpression(e)
+    ) {
+      flowIds(e.expression, out);
+    } else if (ts.isCallExpression(e) || ts.isNewExpression(e)) {
+      flowIds(e.expression, out);
+      if (passesArguments(e.expression)) e.arguments?.forEach((x) => flowIds(x, out));
+    } else if (ts.isTaggedTemplateExpression(e)) flowIds(e.tag, out);
+    else if (ts.isConditionalExpression(e)) {
+      flowIds(e.whenTrue, out);
+      flowIds(e.whenFalse, out);
+    } else if (ts.isBinaryExpression(e)) {
+      const op = e.operatorToken.kind;
+      if (
+        op === ts.SyntaxKind.AmpersandAmpersandToken ||
+        op === ts.SyntaxKind.BarBarToken ||
+        op === ts.SyntaxKind.QuestionQuestionToken
+      ) {
+        flowIds(e.left, out);
+        flowIds(e.right, out);
+      } else if (op === ts.SyntaxKind.CommaToken || op === ts.SyntaxKind.EqualsToken) flowIds(e.right, out);
+    } else if (ts.isObjectLiteralExpression(e)) {
+      for (const prop of e.properties) {
+        if (ts.isPropertyAssignment(prop)) flowIds(prop.initializer, out);
+        else if (ts.isShorthandPropertyAssignment(prop)) out.push(prop.name);
+        else if (ts.isSpreadAssignment(prop)) flowIds(prop.expression, out);
+        else if (ts.isMethodDeclaration(prop)) returnIds(prop, out);
+      }
+    } else if (ts.isArrayLiteralExpression(e)) e.elements.forEach((x) => flowIds(x, out));
+    else if (ts.isArrowFunction(e) || ts.isFunctionExpression(e)) returnIds(e, out);
+    return out;
+  };
+
+  // what a function returns: its expression body or its own return statements
+  const returnIds = (fn: ts.FunctionLikeDeclaration, out: ts.Identifier[]) => {
+    if (!fn.body) return out;
+    if (!ts.isBlock(fn.body)) return flowIds(fn.body, out);
+    const visit = (n: ts.Node): void => {
+      if (ts.isReturnStatement(n)) flowIds(n.expression, out);
+      else if (!ts.isFunctionLike(n)) ts.forEachChild(n, visit);
+    };
+    ts.forEachChild(fn.body, visit);
+    return out;
+  };
+
+  return { flowIds, returnIds };
+};
+
+const typeIds = (type: ts.TypeNode | undefined, out: ts.Identifier[] = []) => {
+  const visit = (n: ts.Node): void => {
+    if (ts.isIdentifier(n)) out.push(n);
+    ts.forEachChild(n, visit);
+  };
+  if (type) visit(type);
   return out;
 };
 
-const carriers = (sf: ts.SourceFile, seeds: Set<string>) => {
-  const decls: { names: string[]; mentions: Set<string> }[] = [];
+const boundIds = (name: ts.BindingName, out: ts.Identifier[] = []) => {
+  if (ts.isIdentifier(name)) out.push(name);
+  else for (const el of name.elements) if (!ts.isOmittedExpression(el)) boundIds(el.name, out);
+  return out;
+};
+
+const symbolOf = (checker: ts.TypeChecker, id: ts.Identifier) => {
+  const s =
+    ts.isShorthandPropertyAssignment(id.parent) && id.parent.name === id
+      ? checker.getShorthandAssignmentValueSymbol(id.parent)
+      : checker.getSymbolAtLocation(id);
+  return s && checker.getExportSymbolOfSymbol(s);
+};
+
+const carriers = (checker: ts.TypeChecker, sf: ts.SourceFile, seeds: ts.Symbol[]) => {
+  const { flowIds, returnIds } = makeFlow(checker);
+  const decls: { names: ts.Identifier[]; from: ts.Identifier[] }[] = [];
   const visit = (n: ts.Node): void => {
     if (ts.isVariableDeclaration(n) || ts.isParameter(n) || ts.isPropertyDeclaration(n)) {
-      const parts: ts.Node[] = [];
-      if (n.type) parts.push(n.type);
-      if (n.initializer) parts.push(n.initializer);
+      const from = flowIds(n.initializer, typeIds(n.type));
       // for (const item of response.output)
       const loop = n.parent.parent;
-      if (ts.isVariableDeclaration(n) && (ts.isForOfStatement(loop) || ts.isForInStatement(loop))) parts.push(loop.expression);
+      if (ts.isVariableDeclaration(n) && (ts.isForOfStatement(loop) || ts.isForInStatement(loop)))
+        flowIds(loop.expression, from);
       const fn = n.parent;
-      // (r) => r.output_text, as an argument of a call that mentions one
-      if (ts.isParameter(n) && !n.type && (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) && ts.isCallExpression(fn.parent)) {
-        parts.push(fn.parent.expression);
+      // (r) => r.output_text, as a callback of a call on one
+      if (
+        ts.isParameter(n) &&
+        !n.type &&
+        (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) &&
+        ts.isCallExpression(fn.parent)
+      ) {
+        flowIds(fn.parent.expression, from);
       }
-      const names = ts.isPropertyDeclaration(n) ? [nameText(n.name) ?? ""] : boundNames(n.name);
-      decls.push({ names, mentions: tokens(parts.map((x) => x.getText(sf)).join(" ")) });
-    } else if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && ts.isIdentifier(n.left)) {
-      // narrowed: error instanceof APIError
-      decls.push({ names: [n.left.text], mentions: tokens(n.right.getText(sf)) });
+      const names = ts.isPropertyDeclaration(n) ? (ts.isIdentifier(n.name) ? [n.name] : []) : boundIds(n.name);
+      decls.push({ names, from });
+    } else if (
+      ts.isBinaryExpression(n) &&
+      n.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword &&
+      ts.isIdentifier(n.left)
+    ) {
+      // narrowed: error instanceof APIError (the narrowed variable as a whole)
+      decls.push({ names: [n.left], from: flowIds(n.right) });
     } else if (ts.isFunctionDeclaration(n) && n.name) {
-      decls.push({ names: [n.name.text], mentions: tokens(n.getText(sf)) });
+      decls.push({ names: [n.name], from: returnIds(n, typeIds(n.type)) });
     }
     ts.forEachChild(n, visit);
   };
   visit(sf);
+  const resolved = decls.map((d) => ({
+    names: d.names.map((x) => symbolOf(checker, x)).filter((x): x is ts.Symbol => !!x),
+    from: d.from.map((x) => symbolOf(checker, x)).filter((x): x is ts.Symbol => !!x),
+  }));
   const tainted = new Set(seeds);
-  for (let changed = true; changed; ) {
+  for (let changed = true; changed;) {
     changed = false;
-    for (const d of decls) {
-      if (d.names.every((x) => tainted.has(x))) continue;
-      if ([...d.mentions].some((m) => tainted.has(m))) {
-        d.names.forEach((x) => tainted.add(x));
-        changed = true;
-      }
+    for (const d of resolved) {
+      if (d.names.every((x) => tainted.has(x)) || !d.from.some((x) => tainted.has(x))) continue;
+      d.names.forEach((x) => tainted.add(x));
+      changed = true;
     }
   }
   return tainted;
 };
 
-// local names bound by imports of pkg, syntactically
-const packageLocals = (sf: ts.SourceFile, pkg: string) => {
-  const names: string[] = [];
+// the local symbols bound by imports of pkg, or of `accept`ed names from
+// other modules
+const importSymbols = (
+  checker: ts.TypeChecker,
+  sf: ts.SourceFile,
+  match: (spec: string) => boolean,
+  accept: (local: ts.Identifier) => boolean = () => true,
+) => {
+  const ids: ts.Identifier[] = [];
   for (const st of sf.statements) {
     if (!ts.isImportDeclaration(st) || !ts.isStringLiteral(st.moduleSpecifier)) continue;
-    if (!isFromPackage(st.moduleSpecifier.text, pkg) || !st.importClause) continue;
+    if (!match(st.moduleSpecifier.text) || !st.importClause) continue;
     const { name, namedBindings: b } = st.importClause;
-    if (name) names.push(name.text);
-    if (b) names.push(...(ts.isNamespaceImport(b) ? [b.name.text] : b.elements.map((e) => e.name.text)));
+    if (name) ids.push(name);
+    if (b) ids.push(...(ts.isNamespaceImport(b) ? [b.name] : b.elements.map((e) => e.name)));
   }
-  return names;
+  return ids
+    .filter(accept)
+    .map((id) => checker.getSymbolAtLocation(id))
+    .filter((x): x is ts.Symbol => !!x);
 };
 
-// project files importing the package -> their names that carry its values
-// (useUser wrapping useQuery); not every export, or one routing helper in a
-// shared module would make all of its exports suspect
-type Importing = Map<string, { sf: ts.SourceFile; carriers?: Set<string> }>;
+// project files importing the package -> their symbols that carry its
+// values; not every export, or one routing helper in a shared module would
+// make all of its exports suspect
+type Importing = Map<string, { sf: ts.SourceFile; carriers?: Set<ts.Symbol> }>;
 
-// locals imported from such project files, under their local names
-const projectSeeds = (sourceFile: SourceFile, importing: Importing, pkg: string) => {
-  const seeds: string[] = [];
+const projectSeeds = (ctx: Ctx, sourceFile: SourceFile, importing: Importing, pkg: string) => {
+  const { checker } = ctx;
+  const targets = new Map<string, Importing extends Map<string, infer V> ? V : never>();
   for (const imp of sourceFile.getImportDeclarations()) {
     const entry = importing.get(imp.getModuleSpecifierSourceFile()?.getFilePath() ?? "");
-    if (!entry) continue;
-    entry.carriers ??= carriers(entry.sf, new Set(packageLocals(entry.sf, pkg)));
-    const clause = imp.getImportClause()?.compilerNode;
-    // the default export's name isn't known here; keep it
-    if (clause?.name) seeds.push(clause.name.text);
-    const b = clause?.namedBindings;
-    if (b && ts.isNamespaceImport(b)) seeds.push(b.name.text);
-    else if (b) {
-      for (const e of b.elements) if (entry.carriers.has((e.propertyName ?? e.name).text)) seeds.push(e.name.text);
-    }
+    if (entry) targets.set(imp.getModuleSpecifierValue(), entry);
   }
-  return seeds;
+  return importSymbols(
+    checker,
+    sourceFile.compilerNode,
+    (spec) => targets.has(spec),
+    (local) => {
+      const decl = local.parent;
+      const st = ts.findAncestor(decl, ts.isImportDeclaration)!;
+      const entry = targets.get((st.moduleSpecifier as ts.StringLiteral).text)!;
+      entry.carriers ??= carriers(
+        checker,
+        entry.sf,
+        importSymbols(checker, entry.sf, (spec) => isFromPackage(spec, pkg)),
+      );
+      // namespace and default imports: kept whole
+      if (!ts.isImportSpecifier(decl)) return true;
+      const alias = checker.getSymbolAtLocation(local);
+      const target = alias && checker.getExportSymbolOfSymbol(resolveAlias(checker, alias));
+      return !!target && entry.carriers.has(target);
+    },
+  );
+};
+
+// whether calling an imported function can hand back the package's API:
+// useRouter() returns a Router, useLocalSearchParams() just strings, and
+// everything derived from those would otherwise count; from declared return
+// types, which are cheap. Non-functions (classes, objects, types) always can.
+const returnsApi = (ctx: Ctx, alias: ts.Symbol) => {
+  const { checker } = ctx;
+  const target = resolveAlias(checker, alias);
+  if (!(target.flags & ts.SymbolFlags.Function)) return true;
+  const sigs = checker.getTypeOfSymbol(target).getCallSignatures();
+  const hasApi = (type: ts.Type, depth: number): boolean => {
+    let t = checker.getNonNullableType(type);
+    if (t.flags & ts.TypeFlags.TypeParameter) t = checker.getBaseConstraintOfType(t) ?? t;
+    if (t.isUnion() || t.isIntersection()) return t.types.some((x) => hasApi(x, depth));
+    if (t.getCallSignatures().some((sig) => depth > 0 && hasApi(sig.getReturnType(), depth - 1))) return true;
+    return t.getProperties().some((p) => familyDecls(ctx, p).length > 0);
+  };
+  return sigs.length === 0 || sigs.some((sig) => hasApi(sig.getReturnType(), 1));
 };
 
 const scanFile = (ctx: Ctx, sourceFile: SourceFile, file: string, pkg: string, importing: Importing) => {
@@ -484,16 +724,31 @@ const scanFile = (ctx: Ctx, sourceFile: SourceFile, file: string, pkg: string, i
   const lineOf = (n: ts.Node) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
   const site = (n: ts.Node) => ({ file, line: lineOf(n) });
   const locals = importsOf(ctx, sf, pkg, lineOf);
-  const tainted = carriers(sf, new Set([...locals.keys(), ...projectSeeds(sourceFile, importing, pkg)]));
+  const tainted = carriers(checker, sf, [
+    ...importSymbols(checker, sf, (spec) => isFromPackage(spec, pkg)).filter((s) => returnsApi(ctx, s)),
+    ...projectSeeds(ctx, sourceFile, importing, pkg),
+  ]);
+  const { flowIds } = makeFlow(checker);
+  const taints = (ids: ts.Identifier[]) =>
+    ids.some((id) => {
+      const s = symbolOf(checker, id);
+      return !!s && tainted.has(s);
+    });
   // the receiver chain's root (client in client.responses.create(...).x),
   // not names in its arguments
   const carries = (n: ts.Node): boolean => {
-    if (ts.isIdentifier(n)) return tainted.has(n.text);
+    if (ts.isIdentifier(n)) return taints([n]);
     if (n.kind === ts.SyntaxKind.ThisKeyword) return true;
     if (
-      ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n) || ts.isCallExpression(n) ||
-      ts.isNewExpression(n) || ts.isParenthesizedExpression(n) || ts.isNonNullExpression(n) ||
-      ts.isAwaitExpression(n) || ts.isAsExpression(n) || ts.isSatisfiesExpression(n)
+      ts.isPropertyAccessExpression(n) ||
+      ts.isElementAccessExpression(n) ||
+      ts.isCallExpression(n) ||
+      ts.isNewExpression(n) ||
+      ts.isParenthesizedExpression(n) ||
+      ts.isNonNullExpression(n) ||
+      ts.isAwaitExpression(n) ||
+      ts.isAsExpression(n) ||
+      ts.isSatisfiesExpression(n)
     ) {
       return carries(n.expression);
     }
@@ -501,22 +756,13 @@ const scanFile = (ctx: Ctx, sourceFile: SourceFile, file: string, pkg: string, i
     if (ts.isTaggedTemplateExpression(n)) return carries(n.tag);
     // destructuring: const { data } = <initializer>, ({ data }: Props)
     if (ts.isBindingElement(n)) return carries(n.parent.parent);
-    if (ts.isVariableDeclaration(n) || ts.isParameter(n)) {
-      return [...tokens([n.type, n.initializer].map((x) => x?.getText(sf) ?? "").join(" "))].some((t) => tainted.has(t));
-    }
+    if (ts.isVariableDeclaration(n) || ts.isParameter(n)) return taints(flowIds(n.initializer, typeIds(n.type)));
     return false;
   };
   // receivers already accounted for by the member use on them
   const skip = new Set<ts.Node>();
-  // one lookup per object literal / JSX element / pattern, not per key
+  const expected = makeExpected(ctx, carries);
   const contextual = new Map<ts.Node, ts.Type | undefined>();
-  const contextualOf = (n: ts.ObjectLiteralExpression | ts.JsxAttributes) => {
-    if (!contextual.has(n)) {
-      const anchored = ts.isJsxAttributes(n) ? isFamilyComponent(ctx, n.parent.tagName) : isAnchored(ctx, n);
-      contextual.set(n, anchored ? checker.getContextualType(n) : undefined);
-    }
-    return contextual.get(n);
-  };
   const typeOf = (n: ts.ObjectBindingPattern) => {
     if (!contextual.has(n)) contextual.set(n, checker.getTypeAtLocation(n));
     return contextual.get(n);
@@ -529,9 +775,10 @@ const scanFile = (ctx: Ctx, sourceFile: SourceFile, file: string, pkg: string, i
       // `export { x } from "pkg"`: passed through to other files
       const spec = node.moduleSpecifier;
       if (spec && ts.isStringLiteral(spec) && isFromPackage(spec.text, pkg)) {
-        const names = node.exportClause && ts.isNamedExports(node.exportClause)
-          ? node.exportClause.elements.map((e) => (e.propertyName ?? e.name).text)
-          : ["*"];
+        const names =
+          node.exportClause && ts.isNamedExports(node.exportClause)
+            ? node.exportClause.elements.map((e) => (e.propertyName ?? e.name).text)
+            : ["*"];
         for (const api of names) record(ctx, { api, owners: [], declaredIn: pkg }, "import", site(node));
         return;
       }
@@ -539,7 +786,11 @@ const scanFile = (ctx: Ctx, sourceFile: SourceFile, file: string, pkg: string, i
 
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const key = ts.isPropertyAccessExpression(node) ? node.name : node.argumentExpression;
-      const name = ts.isPropertyAccessExpression(node) ? node.name.text : ts.isStringLiteralLike(key) ? key.text : undefined;
+      const name = ts.isPropertyAccessExpression(node)
+        ? node.name.text
+        : ts.isStringLiteralLike(key)
+          ? key.text
+          : undefined;
       if (name !== undefined && ctx.names.has(name) && carries(node.expression)) {
         const receiver = node.expression;
         const local = ts.isIdentifier(receiver) ? locals.get(receiver.text) : undefined;
@@ -569,14 +820,16 @@ const scanFile = (ctx: Ctx, sourceFile: SourceFile, file: string, pkg: string, i
     ) {
       const name = nameText(node.name);
       if (name !== undefined && ctx.names.has(name)) {
-        const contextual = contextualOf(node.parent);
-        recordMember(ctx, propertiesOf(ctx, contextual, name), () => contextual, "option", site(node.name));
+        const types = expected(node.parent);
+        const props = types.flatMap((t) => propertiesOf(ctx, t, name));
+        recordMember(ctx, props, () => types.find((t) => typeName(ctx, t)), "option", site(node.name));
       }
     } else if (ts.isJsxAttribute(node)) {
       const name = nameText(node.name);
       if (name !== undefined && ctx.names.has(name)) {
-        const props = contextualOf(node.parent);
-        recordMember(ctx, propertiesOf(ctx, props, name), () => props, "jsx", site(node.name));
+        const types = expected(node.parent);
+        const props = types.flatMap((t) => propertiesOf(ctx, t, name));
+        recordMember(ctx, props, () => types.find((t) => typeName(ctx, t)), "jsx", site(node.name));
       }
     } else if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent) && !node.dotDotDotToken) {
       // const { data, isLoading } = useQuery(...)
@@ -599,7 +852,8 @@ const scanFile = (ctx: Ctx, sourceFile: SourceFile, file: string, pkg: string, i
 
   // imported but never referenced (or only for side effects of the import)
   for (const local of locals.values()) {
-    if (!local.used) record(ctx, { api: local.api, owners: [], declaredIn: local.declaredIn }, "import", { file, line: local.line });
+    if (!local.used)
+      record(ctx, { api: local.api, owners: [], declaredIn: local.declaredIn }, "import", { file, line: local.line });
   }
 };
 
@@ -642,7 +896,6 @@ export const findApiUsage = (projectRoot: string, pkg: string): ApiUsage => {
     family,
     names: declaredNames(programFiles.filter((f) => isFamilyFile(family, f.fileName))),
     libNames: declaredNames(programFiles.filter((f) => program.isSourceFileDefaultLibrary(f))),
-    program,
     uses: new Map(),
   };
   const notes: string[] = [];
@@ -675,10 +928,7 @@ export const findApiUsage = (projectRoot: string, pkg: string): ApiUsage => {
 
 // whether an api-diff member change concerns this use: same member, on the
 // type it was reached through or one that declares it
-export const matchesMemberChange = (
-  use: ApiUse,
-  change: { type: string; owner?: string; member: string },
-) => {
+export const matchesMemberChange = (use: ApiUse, change: { type: string; owner?: string; member: string }) => {
   if (use.member === undefined || use.member !== change.member) return false;
   const names = new Set([...use.owners, ...use.via]);
   return names.has(change.type) || (!!change.owner && names.has(change.owner));
