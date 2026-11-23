@@ -4,7 +4,7 @@ description: Upgrade TypeScript/TSX dependencies to new major versions and fix t
 license: MIT
 compatibility: Requires Node 20+, git, and a TypeScript project with a tsconfig.json. Network access to the npm registry; also helps for reading release notes.
 metadata:
-  version: "3.1.0"
+  version: "3.2.0"
 ---
 
 # safebump
@@ -25,7 +25,7 @@ Run `scripts/safebump <command>`, relative to this skill's directory. It's a sin
 | Preflight | `doctor [pkg[@v]...]` (install matches manifests, checker resolves, Node engines, duplicates) |
 | Choose | `list` (available majors) · `detect <ref>` (what a branch bumped) · `fleet` (every pending upgrade, grouped into branches) · `impact <pkg>[@v]` (blast radius before installing) |
 | Plan | `plan <pkg>[@v]...` (full upgrade set: peers, dependents, lockstep siblings, `@types`, conflicts) · `notes <pkg> <from> <to>` (cached migration notes) · `api-diff <pkg> [from] [to]` (what changed in the APIs this project uses, including changed defaults and deprecations) · `api <pkg>` (new signatures) · `upstream <pkg> <from> <to>` (how the maintainers migrated their own examples and tests) |
-| Prepare | `test-gaps <pkg>...` (code using the package that no test reaches) · `deprecations <pkg>...` (uses of APIs marked `@deprecated`, usually what the next major removes) |
+| Prepare | `test-gaps <pkg>@<to>... [--coverage\|--confirm]` (risky call sites ranked, whether a test actually executes each, and a gate proving it before upgrading) · `deprecations <pkg>...` (uses of APIs marked `@deprecated`, usually what the next major removes) |
 | Apply | `upgrade <pkg>@<v>...` (one install for the whole set) · `duplicates <pkg>...` (more than one installed copy) |
 | Fix | `errors <pkg>...` (errors mapped to blocks, ordered, grouped into parallel waves, repeated errors flagged) · `refs <file> <line>` (callers of a changed declaration) · `codemod <transform.ts>` (one mechanical change across the project) · `checkpoint save/list/restore` (snapshots with error counts; roll back when stuck) · `tsc` |
 | Check | `verify baseline` / `verify` (type check, tests, lint, build: only *new* failures) · `defaults <pkg> <from> <to>` (call sites silently getting a changed default) · `audit [ref]` (added casts, suppressions, weakened tests) |
@@ -85,10 +85,15 @@ For any migration bigger than one quick hop, create it from [assets/progress-tem
    - **Must the migration go one major at a time?** If so, repeat steps 3–5 per major version, committing (or checkpointing in progress.md) between hops.
    - **What can't the type checker see?** You'll need this in step 5. `api-diff`'s "may behave differently" section is the starting list.
 3. **Prepare on the old version.** Making the jump smaller and safer *before* it happens beats repairing it after.
-   1. **Characterization tests.** Run `test-gaps <pkg>...`. For untested files with the most package usage, write focused tests that pin today's behavior: what the code returns, renders or sends.
-      - They must pass *now*, on the old version, and they must still pass after the upgrade.
-      - Ask the user how far to go when there are many gaps. Unattended, cover the top 5 at most.
-      - Files reached only by tests that mock the package count as untested.
+   1. **Characterization tests for the risky call sites.**
+      1. Run `test-gaps <pkg>@<to>... --coverage`. It ranks the call sites the upgrade is most likely to break: removed or changed APIs, changed defaults the code relies on, and, with `--deprecations`, deprecated APIs. It reports whether a test actually *executes* each one, using the project's own runner (Vitest, Jest, `node --test`) with coverage. Files whose tests mock the package count as untested.
+      2. Write tests for every risk site that isn't executed, following [references/characterization-tests.md](references/characterization-tests.md). The key rule: assert on what the code returns and sends to the dependency, and mock *beneath* the package (the network, native modules), never the package itself. With subagents, give each one a group of files.
+      3. Run `test-gaps <pkg>@<to>... --confirm`. It must pass before you apply the upgrade:
+         - every risk site is executed by a test
+         - the tests pass on the current version
+         - it saves a checkpoint and records the result in `.safebump/coverage-confirmed.json`
+      - **If coverage can't be collected** (e.g. Vitest without `@vitest/coverage-v8`), the report falls back to static reachability and names the missing package. Ask before adding it. Unattended, continue on static reachability and say so in the report.
+      - **Unreachable sites:** some sites are impractical to test (e.g. code that only runs on a device). List them in the report rather than writing a test that mocks the package.
    2. **Deprecations first.** If the upgrade crosses a major and a newer release of the *current* major exists:
       1. Move to it first: `plan <pkg>@<current-major>`, then upgrade.
       2. Run `deprecations <pkg>...`, and fix every use with the replacement its message names.

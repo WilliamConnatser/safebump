@@ -28,8 +28,11 @@ Commands:
   defaults <pkg> [from] [to]
                             Options whose default changed between versions, and the call sites that omit them
                             (so they silently get the new default), with the old value to pin
-  test-gaps <pkg>...        Files using the packages that no test reaches (or only with the package mocked):
-                            where to write characterization tests before upgrading
+  test-gaps <pkg>[@to]...   Code using the packages that tests don't cover. With @to: the call sites the upgrade
+                            is most likely to break (removed/changed APIs, changed defaults; --deprecations adds
+                            deprecated uses), ranked. --coverage runs the project's tests with coverage to show
+                            which sites actually execute. --confirm is the gate before upgrading: every risk site
+                            executed by passing tests on the current version; saves a checkpoint; exit 1 if not
   upstream <pkg> [from] [to]
                             How the package's maintainers changed their own examples, docs and tests between the
                             versions, ranked by the names this project imports (--max-files, --max-lines)
@@ -75,6 +78,7 @@ Options:
 
 Per project, in `.safebump/`, which ignores itself in git:
 - `baseline.json`: written by `verify baseline`.
+- `coverage-confirmed.json`: written by `test-gaps --confirm`: the risk sites proven executed, and the checkpoint.
 - `progress.md`: the migration log you keep.
 - `migrations/<pkg>/<from>-to-<to>.md`: saved by `notes save`.
 - `codemods/`: your codemod transforms.

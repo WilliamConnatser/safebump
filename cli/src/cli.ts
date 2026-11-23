@@ -26,6 +26,15 @@ import { buildReport } from "./lib/report";
 import { diffApi, printApiDiff } from "./lib/typescript/apidiff";
 import { findDefaultReliance, printDefaultReliance } from "./lib/typescript/defaults";
 import { findTestGaps, printTestGaps } from "./lib/test-gaps";
+import { measureCoverage, printCoverage } from "./lib/coverage";
+import {
+  annotate,
+  confirmCoverage,
+  findRiskSites,
+  printConfirmation,
+  printRiskReport,
+} from "./lib/risk-sites";
+import { getPackument, resolveVersion } from "./lib/registry";
 import { printUpstream, upstreamExamples } from "./lib/upstream";
 import { findDeprecations, printDeprecations } from "./lib/deprecations";
 import { findDuplicates, printDoctor, printDuplicates, runDoctor } from "./lib/doctor";
@@ -72,8 +81,11 @@ Commands:
   defaults <pkg> [from] [to]
                             Options whose default changed between versions, and the call sites that omit them
                             (so they silently get the new default), with the old value to pin
-  test-gaps <pkg>...        Files using the packages that no test reaches (or only with the package mocked):
-                            where to write characterization tests before upgrading
+  test-gaps <pkg>[@to]...   Code using the packages that tests don't cover. With @to: the call sites the upgrade
+                            is most likely to break (removed/changed APIs, changed defaults; --deprecations adds
+                            deprecated uses), ranked. --coverage runs the project's tests with coverage to show
+                            which sites actually execute. --confirm is the gate before upgrading: every risk site
+                            executed by passing tests on the current version; saves a checkpoint; exit 1 if not
   upstream <pkg> [from] [to]
                             How the package's maintainers changed their own examples, docs and tests between the
                             versions, ranked by the names this project imports (--max-files, --max-lines)
@@ -283,6 +295,9 @@ const main = async () => {
       "all-workspaces": { type: "boolean", default: false },
       timeout: { type: "string" },
       fast: { type: "boolean", default: false },
+      coverage: { type: "boolean", default: false },
+      confirm: { type: "boolean", default: false },
+      deprecations: { type: "boolean", default: false },
       errors: { type: "string" },
       "max-files": { type: "string" },
       "max-lines": { type: "string" },
@@ -403,8 +418,43 @@ const main = async () => {
     }
     case "test-gaps": {
       need(1);
-      const r = findTestGaps(root, args);
-      return out(r, () => printTestGaps(r));
+      const targets = parseTargets(args);
+      const gaps = findTestGaps(root, targets.map((t) => t.name));
+      const wantCoverage = values.coverage || values.confirm;
+      const coverage = wantCoverage
+        ? await measureCoverage(root, {
+            sourceFiles: gaps.files.map((f) => f.file),
+            timeoutMs: values.timeout ? Number(values.timeout) * 1000 : undefined,
+          })
+        : undefined;
+
+      // `pkg@version` targets turn on risk ranking against that version
+      const versioned: { name: string; to: string }[] = [];
+      for (const t of targets.filter((t) => t.spec)) {
+        const to = resolveVersion(await getPackument(root, t.name), t.spec);
+        if (to) versioned.push({ name: t.name, to });
+      }
+      const risk = versioned.length
+        ? annotate(
+            await findRiskSites(root, gaps, versioned, { deprecations: values.deprecations }),
+            gaps,
+            coverage,
+          )
+        : undefined;
+      if (values.confirm && !risk) {
+        console.error("--confirm needs target versions: test-gaps <pkg>@<version>...");
+        process.exit(2);
+      }
+      const confirmation =
+        values.confirm && risk && coverage ? await confirmCoverage(root, risk, coverage) : undefined;
+      if (confirmation && !confirmation.ok) process.exitCode = 1;
+
+      return out({ gaps, coverage, risk, confirmation }, () => {
+        printTestGaps(gaps);
+        if (coverage) printCoverage(coverage);
+        if (risk) printRiskReport(risk);
+        if (confirmation) printConfirmation(confirmation);
+      });
     }
     case "api-diff": {
       need(1);
@@ -444,6 +494,11 @@ const main = async () => {
           console.log(`${u.packageName}: ${u.from} → ${u.written}${where}`);
         }
         console.log(`Ran ${result.packageManager} install.`);
+        for (const d of result.drift) {
+          console.log(
+            `! ${d.packageName}: installed ${d.installed}, not the ${d.requested} you planned. The kept range prefix let the package manager pick a newer release. Re-run api-diff/defaults/test-gaps for ${d.installed}, or upgrade to it explicitly.`,
+          );
+        }
         if (result.peerWarnings.length > 0) {
           console.log(
             `\nThe install reported peer dependency problems:\n${result.peerWarnings.join("\n")}`,

@@ -60,6 +60,8 @@ jobs:
           git add -A && git commit -qm "smoke baseline" --allow-empty
           $B checkpoint save baseline --fast
           $B test-gaps @tanstack/react-query | grep -q "Uncovered"
+          # risk ranking against the target version (static: the example has no tests)
+          $B test-gaps @tanstack/react-query@5.59.0 | grep -q "Risk sites"
           $B impact @tanstack/react-query@5.59.0 --json > impact.json
           node -e '
             const r = require("./impact.json");
