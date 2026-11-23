@@ -1,0 +1,102 @@
+name: skill
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Validate against the Agent Skills spec
+        run: uvx --from "git+https://github.com/agentskills/agentskills#subdirectory=skills-ref" skills-ref validate skills/safebump
+
+      - name: Check versions match
+        run: |
+          skill=$(sed -n 's/^  version: "\(.*\)"$/\1/p' skills/safebump/SKILL.md)
+          plugin=$(node -p 'require("./.claude-plugin/plugin.json").version')
+          [ "$skill" = "$plugin" ] || { echo "SKILL.md metadata.version ($skill) != plugin.json version ($plugin)"; exit 1; }
+
+      - name: Typecheck and build the CLI
+        working-directory: cli
+        run: npm ci && npm run typecheck && npm run build
+
+      # the bundle, LICENSE and notices in skills/safebump are generated and
+      # committed; they must match the source
+      - name: Check the committed bundle is up to date
+        run: |
+          git diff --exit-code -- skills/safebump || {
+            echo "skills/safebump is out of date: run 'npm run build' in cli/ and commit the result"
+            exit 1
+          }
+
+      # the published skill must run with nothing installed next to it
+      - name: Check the skill is self-contained
+        run: |
+          find skills/safebump \( -name package.json -o -name node_modules -o -name '*.ts' -path '*/scripts/*' \) -print | grep . && exit 1
+          cp -r skills/safebump "$RUNNER_TEMP/standalone"
+          node "$RUNNER_TEMP/standalone/scripts/safebump.mjs" --help > /dev/null
+
+      - name: Smoke test against the example
+        working-directory: examples/react-query-v4
+        run: |
+          B=../../skills/safebump/scripts/safebump
+          npm ci
+          git config --global user.email ci@example.com && git config --global user.name ci
+          $B doctor @tanstack/react-query@5.59.0
+          $B verify baseline
+          git add -A && git commit -qm "smoke baseline" --allow-empty
+          $B checkpoint save baseline --fast
+          $B test-gaps @tanstack/react-query | grep -q "Uncovered"
+          $B impact @tanstack/react-query@5.59.0 --json > impact.json
+          node -e '
+            const r = require("./impact.json");
+            if (r.risk !== "high") throw new Error("expected high risk, got " + r.risk);
+            console.log("impact ok", r.risk);
+          '
+          $B api-diff @tanstack/react-query 4.36.1 5.59.0 | grep -q "gcTime"
+          $B plan @tanstack/react-query@5.59.0 --json > plan.json
+          node -e '
+            const p = require("./plan.json");
+            const names = p.upgrades.map((u) => u.name);
+            if (!names.includes("@tanstack/react-query-devtools"))
+              throw new Error("plan should pull in the devtools package: " + names);
+            console.log("plan ok", names);
+          '
+          # deprecations-first: the latest 4.x flags the positional overload
+          $B upgrade @tanstack/react-query@4.44.0 @tanstack/react-query-devtools@4.44.0
+          $B deprecations @tanstack/react-query | grep -q "useQuery"
+          $B upgrade @tanstack/react-query@5.59.0 @tanstack/react-query-devtools@5.59.0
+          $B duplicates @tanstack/react-query
+          $B checkpoint save upgraded
+          $B defaults @tanstack/react-query 4.44.0 5.59.0 > /dev/null
+          if $B tsc > /dev/null; then echo "expected type errors after the v5 bump"; exit 1; fi
+          $B errors @tanstack/react-query @tanstack/react-query-devtools --json > errors.json
+          node -e '
+            const a = require("./errors.json");
+            const ids = a.blocks.map((b) => b.id);
+            if (ids.indexOf("src/queries.ts:7-13") > ids.indexOf("src/App.tsx:5-10"))
+              throw new Error("useUser should be ordered before App: " + ids);
+            console.log("errors ok", ids);
+          '
+          $B api @tanstack/react-query | grep -q "declare function useQuery"
+          # verify must flag the upgrade's type errors as new; audit must
+          # catch a planted cast and pass without it
+          if $B verify > /dev/null; then echo "verify should report new failures"; exit 1; fi
+          $B audit
+          sed -i 's/useUser("1")/useUser("1") as any/' src/App.tsx
+          if $B audit > /dev/null; then echo "audit should flag the cast"; exit 1; fi
+          git checkout -- src/App.tsx
+          $B notes @tanstack/react-query 4.36.1 5.59.0 | grep -q "gcTime"
