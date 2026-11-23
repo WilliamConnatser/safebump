@@ -1,41 +1,14 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# Dependencies (the published skill has none; cli/, evals/ and examples/ are dev-only)
+node_modules/
 
-# Dependencies
-node_modules
-.pnp
-.pnp.js
+# safebump's per-project working files (baselines, checkpoints log, notes)
+.safebump/
 
-# Local env files
+# Eval runs
+evals/results/
+
+# Logs and local environment
+*.log
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# Testing
-coverage
-
-# Turbo
-.turbo
-
-# Vercel
-.vercel
-
-# Build Outputs
-.next/
-out/
-build
-dist
-
-
-# Debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Misc
+.env.*
 .DS_Store
-*.pem
-.vscode/launch.json
-**/log/*
-**/output/*

@@ -1,0 +1,16 @@
+{
+  "name": "safebump-example-react-query-v4",
+  "private": true,
+  "description": "A tiny app on @tanstack/react-query v4 for trying the safebump skill: upgrading to v5 breaks it, and the devtools package has to move with it",
+  "dependencies": {
+    "@tanstack/react-query": "4.36.1",
+    "@tanstack/react-query-devtools": "4.36.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0",
+    "typescript": "5.6.3"
+  }
+}

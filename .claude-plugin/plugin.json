@@ -1,0 +1,7 @@
+{
+  "name": "safebump",
+  "version": "3.1.0",
+  "description": "Major dependency upgrades your coding agent can prove are safe: plans packages that move together, fixes breakage in dependency order, verifies against a baseline",
+  "author": { "name": "William Connatser" },
+  "license": "MIT"
+}

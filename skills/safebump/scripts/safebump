@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs the bundled safebump CLI. Equivalent to `node scripts/safebump.mjs`,
+# which also works where there's no POSIX shell (Windows).
+exec node "$(dirname "$0")/safebump.mjs" "$@"

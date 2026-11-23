@@ -1,0 +1,24 @@
+{
+  "name": "safebump-cli",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Source of the safebump skill CLI. Builds to ../skills/safebump/scripts/safebump.mjs",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "@types/semver": "^7.5.8",
+    "esbuild": "^0.25.10",
+    "semver": "^7.6.0",
+    "ts-morph": "^25.0.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
