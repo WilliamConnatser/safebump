@@ -37,7 +37,8 @@ jobs:
       # committed; they must match the source
       - name: Check the committed bundle is up to date
         run: |
-          git diff --exit-code -- skills/safebump || {
+          # new chunk files are untracked, which `git diff` alone would miss
+          if git status --porcelain -- skills/safebump | grep .; then false; fi || {
             echo "skills/safebump is out of date: run 'npm run build' in cli/ and commit the result"
             exit 1
           }

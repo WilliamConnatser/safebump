@@ -50,7 +50,11 @@ Or ask _"what major upgrades are available?"_, or on a dependency-update PR's br
 
 The skill is self-contained: one minified script bundle, nothing to install and no dependencies added to your project. It needs Node 20+ and git.
 
-**On every Renovate or Dependabot PR**, `safebump ci` gives the upgrade a verdict with no agent and no LLM cost. It checks that the upgrade set is complete, that nothing broke relative to the base branch, that nothing was papered over, and that the risky call sites run under passing tests. It reports **blocked**, **low**, **medium** or **high** risk as a PR comment and two statuses: a required one that blocks broken upgrades, and one that lets Renovate auto-merge only proven low-risk updates. An optional agent job then fixes what it can, writing characterization tests on the old version first. Pipelines for GitHub Actions and GitLab CI, plus a generated `renovate.json`, are in [examples/react-query-v4](examples/react-query-v4).
+**On every Renovate or Dependabot PR**, `safebump ci` gives the upgrade a verdict. It checks that the upgrade set is complete, that nothing broke relative to the base branch, that nothing was papered over, and that the risky changes are proven: by tests, and by a diff of the dependency's own source for the APIs you use. It posts **blocked**, **low**, **medium** or **high** as a PR comment, plus two statuses. One is required and blocks broken upgrades; the other lets Renovate auto-merge only proven low-risk updates.
+
+That deterministic mode has no AI and no LLM cost. **AI mode is opt-in:** a sandboxed reviewer grades medium- and high-risk updates against your actual API usage and the release notes, and a coding agent fixes broken upgrades. It works with Anthropic, Bedrock, Vertex AI, Foundry, OpenAI, Azure OpenAI, Google AI, or any OpenAI-compatible endpoint.
+
+`safebump init` sets it all up: `safebump.yml`, the GitHub Actions or GitLab CI pipeline, and `renovate.json`. See [examples/react-query-v4](examples/react-query-v4).
 
 ## ⚙️ How it works
 

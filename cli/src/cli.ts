@@ -21,8 +21,15 @@ import { findNotes, printNotes, saveNote } from "./lib/notes";
 import type { UpgradePlan } from "./lib/plan";
 import type { MigrationTool } from "./lib/migration-tools";
 import { auditDiff, printAudit } from "./lib/audit";
-import { printCi, runCi } from "./lib/ci";
+import { effectiveAgentMode, postCi, printCi, runCi, saveCiReport } from "./lib/ci";
+import { loadConfig } from "./lib/config";
+import { prepareBase, removeBase, runInstall } from "./lib/base-worktree";
+import { finishFix, prepareFix, runFixAgent, runReviewMode } from "./lib/agent";
+import { runInit, writeInit } from "./lib/init";
 import { renovateConfig } from "./lib/renovate";
+import { buildReviewBrief } from "./lib/review-brief";
+import { findApiUsage, printApiUsage } from "./lib/typescript/usage";
+import { fetchReleaseNotes, printReleaseNotes } from "./lib/release-notes";
 import { previewImpact, printImpact } from "./lib/impact";
 import { findMigrationTools, printMigrationTools } from "./lib/migration-tools";
 import { buildReport } from "./lib/report";
@@ -62,13 +69,35 @@ import { planUpgrades } from "./lib/plan";
 const USAGE = `Usage: safebump <command> [args] [options]
 
 Commands:
+  init                      Set up safebump in this repo: asks a few questions (CI platform, deterministic or AI,
+                            provider, model, agent), writes safebump.yml, the pipeline and renovate.json, and
+                            prints what to configure on the CI platform. Non-interactive with --yes plus
+                            --platform --mode --provider --model --region --project --base-url --agent
+                            [--no-review] [--no-fix]. --write-ci regenerates the pipeline from safebump.yml
+  agent --mode review|fix --base <ref> [--post]
+                            The opt-in AI half (safebump.yml mode: ai). review: the built-in reviewer judges each
+                            change against the APIs this project uses and the release notes, posts its assessment
+                            (can raise risk, never enables auto-merge). fix: --prepare (prompt + base checkout),
+                            --run (the agent CLI, provider from safebump.yml), --finish (re-assure, commit, push,
+                            post); with none of those, all three in order
+  install                   Install the project's dependencies with its package manager (npm ci, pnpm/yarn/bun)
   ci --base <ref>           Assurance pass for a dependency-update PR (Renovate, Dependabot, manual), no agent:
                             doctor, what was bumped and from what, complete upgrade set, duplicates, new failures
                             vs the base-branch baseline, audit, and risk sites proven by tests (runtime coverage).
                             Verdict low/medium/high or blocked. Exit 1 when blocked, or at/above --fail-on
                             <medium|high>. --markdown <file> writes the PR comment; --outputs <file> writes
-                            RISK/BLOCKED/NEEDS_AGENT as dotenv (GITHUB_OUTPUT is written automatically);
-                            --skip-coverage skips the test run used for risk sites
+                            RISK/BLOCKED/NEEDS_AGENT/AGENT_MODE as dotenv (GITHUB_OUTPUT is written automatically);
+                            --skip-coverage skips the test run used for risk sites. --baseline records the
+                            baseline on a checkout of the base branch first (--keep-base <dir> keeps it for fix
+                            mode). --post posts the comment and the safebump / safebump/automerge statuses
+                            (GitHub Actions or GitLab CI). Reads safebump.yml for failOn, coverage, AI mode
+  review-brief --base <ref> | review-brief <pkg> <from> <to>
+                            The review agent's brief: every part of the dependency's API this project uses (incl.
+                            instance methods, option keys, destructured results, JSX props) × what changed in it ×
+                            whether tests run it × release notes for every version crossed. --out <file>
+  usage <pkg>               The parts of a dependency's API this project uses, with call sites
+  release-notes <pkg> <from> <to>
+                            Release notes for every version crossed (GitHub releases, changelog, registry)
   renovate-config           A renovate.json that cooperates with safebump: package families grouped into one PR
                             (from source repos / scopes), automerge for patch/minor gated by the
                             safebump/automerge status, majors always reviewed. Prints JSON
@@ -312,8 +341,28 @@ const main = async () => {
       base: { type: "string" },
       "fail-on": { type: "string" },
       markdown: { type: "string" },
+      out: { type: "string" },
       outputs: { type: "string" },
       "skip-coverage": { type: "boolean", default: false },
+      baseline: { type: "boolean", default: false },
+      "keep-base": { type: "string" },
+      post: { type: "boolean", default: false },
+      mode: { type: "string" },
+      yes: { type: "boolean", default: false },
+      platform: { type: "string" },
+      provider: { type: "string" },
+      model: { type: "string" },
+      region: { type: "string" },
+      project: { type: "string" },
+      "base-url": { type: "string" },
+      agent: { type: "string" },
+      "no-review": { type: "boolean", default: false },
+      "no-fix": { type: "boolean", default: false },
+      force: { type: "boolean", default: false },
+      "write-ci": { type: "boolean", default: false },
+      prepare: { type: "boolean", default: false },
+      run: { type: "boolean", default: false },
+      finish: { type: "boolean", default: false },
       confirm: { type: "boolean", default: false },
       deprecations: { type: "boolean", default: false },
       errors: { type: "string" },
@@ -374,22 +423,118 @@ const main = async () => {
         console.error("ci needs --base <ref>, e.g. --base origin/main");
         process.exit(2);
       }
+      const { config, problems } = loadConfig(root);
+      for (const p of problems) console.error(`safebump.yml: ${p}`);
+      // the baseline comes from a checkout of the base branch, so failures
+      // that already exist there aren't charged to this PR
+      if (values.baseline) {
+        const base = await prepareBase(root, values.base, {
+          dir: values["keep-base"],
+          checkerOverride: values.checker,
+        });
+        if (!values["keep-base"]) await removeBase(root, base.dir);
+      }
       const r = await runCi(root, {
         base: values.base,
         checker: resolveChecker(root, values.checker),
+        coverage: config.ci.coverage && !values["skip-coverage"],
+        timeoutMs: values.timeout ? Number(values.timeout) * 1000 : undefined,
+      });
+      const agentMode = effectiveAgentMode(r, config);
+      saveCiReport(root, { ...r, agentMode });
+      if (values.markdown) writeFileSync(values.markdown, r.markdown);
+      const lines = [`RISK=${r.risk}`, `BLOCKED=${r.blocked}`, `NEEDS_AGENT=${r.needsAgent}`, `AGENT_MODE=${agentMode}`];
+      if (values.outputs) writeFileSync(values.outputs, `${lines.join("\n")}\n`);
+      if (process.env.GITHUB_OUTPUT) {
+        appendFileSync(process.env.GITHUB_OUTPUT, `${lines.map((l) => l.replace(/^[A-Z_]+/, (k) => k.toLowerCase())).join("\n")}\n`);
+      }
+      if (values.post) await postCi(r);
+      const order = ["low", "medium", "high"];
+      const failOn = values["fail-on"] ?? (config.ci.failOn === "blocked" ? undefined : config.ci.failOn);
+      if (r.blocked || (failOn && order.indexOf(r.risk) >= order.indexOf(failOn))) process.exitCode = 1;
+      return out({ ...r, agentMode }, () => printCi(r));
+    }
+    case "init": {
+      if (values["write-ci"]) {
+        const { config, problems, file } = loadConfig(root);
+        if (!file) throw new Error("no safebump.yml here: run `safebump init` first");
+        if (problems.length > 0) throw new Error(`safebump.yml: ${problems.join("; ")}`);
+        const r = writeInit(root, config, { ciOnly: true });
+        return out(r, () => console.log(`Wrote ${r.written.join(", ")}`));
+      }
+      const r = await runInit(
+        root,
+        {
+          platform: values.platform as "github" | "gitlab" | undefined,
+          mode: values.mode as "deterministic" | "ai" | undefined,
+          provider: values.provider as never,
+          model: values.model,
+          region: values.region,
+          project: values.project,
+          baseURL: values["base-url"],
+          agent: values.agent as never,
+          review: values["no-review"] ? false : undefined,
+          fix: values["no-fix"] ? false : undefined,
+        },
+        { interactive: !values.yes && process.stdin.isTTY === true, force: values.force },
+      );
+      return out(r, () => {
+        if (r.written.length) console.log(`Wrote: ${r.written.join(", ")}`);
+        if (r.skipped.length) console.log(`Kept existing (use --force for safebump.yml): ${r.skipped.join(", ")}`);
+        for (const p of r.problems) console.log(`! safebump.yml: ${p}`);
+        console.log(`\nNext, on your CI platform:`);
+        for (const item of r.checklist) console.log(`- ${item}`);
+      });
+    }
+    case "agent": {
+      if (!values.base || (values.mode !== "review" && values.mode !== "fix")) {
+        console.error("agent needs --mode review|fix and --base <ref>");
+        process.exit(2);
+      }
+      const { config, problems } = loadConfig(root);
+      if (problems.length > 0) throw new Error(`safebump.yml: ${problems.join("; ")}`);
+      const timeoutMs = values.timeout ? Number(values.timeout) * 1000 : undefined;
+      if (values.mode === "review") {
+        const r = await runReviewMode(root, config, { base: values.base, post: values.post, timeoutMs });
+        return out(r, () => console.log(r.body));
+      }
+      const all = !values.prepare && !values.run && !values.finish;
+      if (all || values.prepare) await prepareFix(root, config, { base: values.base, checker: values.checker });
+      if (all || values.run) {
+        const code = await runFixAgent(root, config);
+        if (code !== 0) console.error(`the fix agent exited with ${code}; finishing anyway so its partial work is re-assured`);
+      }
+      if (all || values.finish) {
+        const r = await finishFix(root, config, { base: values.base, post: values.post });
+        if (r.r.blocked) process.exitCode = 1;
+        return out(r, () => printCi(r.r));
+      }
+      return;
+    }
+    case "install": {
+      const r = await runInstall(root);
+      console.log(`Ran ${r.command} in ${r.root}`);
+      return;
+    }
+    case "review-brief": {
+      const brief = await buildReviewBrief(root, {
+        base: values.base,
+        targets: values.base || args.length < 3 ? undefined : [{ name: args[0]!, from: args[1]!, to: args[2]! }],
         coverage: !values["skip-coverage"],
         timeoutMs: values.timeout ? Number(values.timeout) * 1000 : undefined,
       });
-      if (values.markdown) writeFileSync(values.markdown, r.markdown);
-      const lines = [`RISK=${r.risk}`, `BLOCKED=${r.blocked}`, `NEEDS_AGENT=${r.needsAgent}`];
-      if (values.outputs) writeFileSync(values.outputs, `${lines.join("\n")}\n`);
-      if (process.env.GITHUB_OUTPUT) {
-        appendFileSync(process.env.GITHUB_OUTPUT, `${lines.map((l) => l.toLowerCase().replace(/^([a-z_]+)=/, (m) => m)).join("\n")}\n`);
-      }
-      const order = ["low", "medium", "high"];
-      const failOn = values["fail-on"];
-      if (r.blocked || (failOn && order.indexOf(r.risk) >= order.indexOf(failOn))) process.exitCode = 1;
-      return out(r, () => printCi(r));
+      if (values.out) writeFileSync(values.out, brief);
+      return out({ markdown: brief }, () => (values.out ? console.log(`Wrote ${values.out}`) : console.log(brief)));
+    }
+    case "usage": {
+      need(1);
+      const u = findApiUsage(root, args[0]!);
+      return out(u, () => printApiUsage(u));
+    }
+    case "release-notes": {
+      need(3);
+      const r = await fetchReleaseNotes(root, args[0]!, args[1]!, args[2]!);
+      return out(r, () => printReleaseNotes(r));
     }
     case "renovate-config": {
       console.log(JSON.stringify(renovateConfig(root), null, 2));

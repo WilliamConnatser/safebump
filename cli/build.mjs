@@ -1,8 +1,11 @@
-// Builds the published skill's CLI: one minified, self-contained ESM bundle
+// Builds the published skill's CLI: a minified, self-contained ESM bundle
 // in skills/safebump/scripts/, so installing the skill copies no sources,
-// no package.json and needs no `npm install`. Also writes the license files
-// the skill folder needs when it's copied into someone's repo on its own.
-import { copyFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
+// no package.json and needs no `npm install`. Code loaded only in AI mode
+// (the AI SDK and its providers, via dynamic import) is split into
+// scripts/chunks/, so deterministic commands never load it. Also writes the
+// license files the skill folder needs when it's copied into someone's repo
+// on its own.
+import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { build } from "esbuild";
@@ -10,16 +13,26 @@ import { build } from "esbuild";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..");
 const skill = path.join(repo, "skills", "safebump");
-const outfile = path.join(skill, "scripts", "safebump.mjs");
+const outdir = path.join(skill, "scripts");
+const outfile = path.join(outdir, "safebump.mjs");
+const chunkDir = path.join(outdir, "chunks");
 
 const version = /^\s+version:\s*"([^"]+)"/m.exec(readFileSync(path.join(skill, "SKILL.md"), "utf-8"))?.[1];
 if (!version) throw new Error("SKILL.md has no metadata.version");
 
+// chunk names carry content hashes: drop the previous build's
+rmSync(chunkDir, { recursive: true, force: true });
+
 const result = await build({
-  entryPoints: [path.join(here, "src", "cli.ts")],
-  outfile,
+  entryPoints: { safebump: path.join(here, "src", "cli.ts") },
+  outdir,
+  splitting: true,
+  chunkNames: "chunks/[name]-[hash]",
+  outExtension: { ".js": ".mjs" },
   bundle: true,
   platform: "node",
+  // node builtins esbuild 0.25 doesn't list as such
+  external: ["readline/promises"],
   target: "node20",
   format: "esm",
   minify: true,
@@ -28,7 +41,7 @@ const result = await build({
   logLevel: "warning",
   banner: {
     js: [
-      `// safebump ${version}. MIT License; see ../LICENSE. Bundled third-party code: see ../THIRD_PARTY_NOTICES.md.`,
+      `// safebump ${version}. MIT License; see LICENSE in the skill folder. Bundled third-party code: see THIRD_PARTY_NOTICES.md there.`,
       // bundled CommonJS dependencies (typescript, ts-morph) call require
       `import { createRequire as __safebumpCreateRequire } from "module"; const require = __safebumpCreateRequire(import.meta.url);`,
       // ...and read __filename/__dirname, which ES modules don't define
@@ -38,6 +51,7 @@ const result = await build({
 });
 
 // third-party notices for exactly the packages that ended up in the bundle
+// or any of its chunks (the metafile's inputs cover every output)
 const packageRoot = (input) => {
   const parts = input.split("/");
   const i = parts.lastIndexOf("node_modules");
@@ -82,7 +96,7 @@ writeFileSync(
   [
     "# Third-party notices",
     "",
-    "`scripts/safebump.mjs` bundles the following packages. Their licenses are reproduced below.",
+    "`scripts/safebump.mjs` and `scripts/chunks/` bundle the following packages. Their licenses are reproduced below.",
     "",
     ...notices.map((n) => `- ${n.name}@${n.version} (${n.license})`),
     "",
@@ -93,5 +107,19 @@ writeFileSync(
 // the skill is copied into other repos without the repo root
 copyFileSync(path.join(repo, "LICENSE"), path.join(skill, "LICENSE"));
 
-const kb = (f) => `${Math.round(statSync(f).size / 1024)} KB`;
-console.log(`built ${path.relative(repo, outfile)} (${kb(outfile)}) with ${notices.length} bundled packages: ${notices.map((n) => n.name).join(", ")}`);
+const kb = (bytes) => `${Math.round(bytes / 1024)} KB`;
+const outputs = Object.entries(result.metafile.outputs).filter(([f]) => f.endsWith(".mjs"));
+const mainKey = path.relative(process.cwd(), outfile).split(path.sep).join("/");
+const main = result.metafile.outputs[mainKey];
+// what a deterministic command loads: the entry plus its static imports
+const loaded = new Set();
+const visit = (f) => {
+  if (loaded.has(f)) return;
+  loaded.add(f);
+  for (const i of result.metafile.outputs[f]?.imports ?? []) if (i.kind === "import-statement" && !i.external) visit(i.path);
+};
+visit(mainKey);
+const sum = (files) => files.reduce((n, f) => n + result.metafile.outputs[f].bytes, 0);
+console.log(
+  `built ${path.relative(repo, outfile)} (${kb(main?.bytes ?? statSync(outfile).size)}; ${kb(sum([...loaded]))} loaded by deterministic commands) + ${outputs.length - 1} AI-mode chunks (${kb(sum(outputs.map(([f]) => f).filter((f) => !loaded.has(f))))}) with ${notices.length} bundled packages: ${notices.map((n) => n.name).join(", ")}`,
+);

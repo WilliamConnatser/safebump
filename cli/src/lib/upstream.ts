@@ -750,3 +750,40 @@ export const printUpstream = (r: UpstreamResult) => {
     if (r.omitted > 0) console.log(`(+${r.omitted} more)`);
   }
 };
+
+// --- for other modules ----------------------------------------------------------
+
+export type ResolvedSide = { version: string; ref: string; how: RefHow; sha: string };
+export type ResolvedCommits = { repo: RepoInfo; dir: string; from: ResolvedSide; to: ResolvedSide; notes: string[] };
+
+// The cache repo with both versions' commits (trees only) fetched, for
+// callers that read blobs themselves through gitIn.
+export const resolveCommits = async (
+  projectRoot: string,
+  pkg: string,
+  from: string,
+  to: string,
+  refs: { fromRef?: string; toRef?: string } = {},
+): Promise<ResolvedCommits> => {
+  const [mFrom, mTo] = await Promise.all([getManifest(projectRoot, pkg, from), getManifest(projectRoot, pkg, to)]);
+  const repo = parseRepository(mTo?.repository) ?? parseRepository(mFrom?.repository);
+  if (!repo) throw new Error(`${pkg}@${to} has no usable "repository" field in the registry.`);
+  const dir = await ensureRepo(repo);
+  const notes: string[] = [];
+  const [a, b] = await resolveSides(
+    projectRoot,
+    dir,
+    repo,
+    pkg,
+    [
+      { version: from, gitHead: mFrom?.gitHead, explicit: refs.fromRef },
+      { version: to, gitHead: mTo?.gitHead, explicit: refs.toRef },
+    ],
+    notes,
+  );
+  const side = (s: Side & { sha: string }, version: string): ResolvedSide => ({ version, ref: s.ref, how: s.how, sha: s.sha });
+  return { repo, dir, from: side(a!, from), to: side(b!, to), notes };
+};
+
+// git in the cache repo; lazy fetching stays off unless asked for
+export const gitIn = (dir: string, args: string[], opts: { lazy?: boolean; timeout?: number } = {}) => git(args, dir, opts);

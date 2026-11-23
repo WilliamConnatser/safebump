@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync } from "fs";
 import path from "path";
 import semver from "semver";
 
@@ -13,7 +14,12 @@ import { annotate, findRiskSites } from "./risk-sites";
 import { run } from "./subprocess";
 import { findTestGaps } from "./test-gaps";
 import { readBaseline, verify } from "./verify";
+import { diffImplementations } from "./impl-diff";
+import { findApiUsage } from "./typescript/usage";
 import { findWorkspaceRoot } from "./workspaces";
+import type { SafebumpConfig } from "./config";
+import { detectForge, MARKERS } from "./forge";
+import { stateDir } from "./state";
 
 // `safebump ci`: the deterministic assurance pass for a dependency-update PR
 // (Renovate, Dependabot, a person). No agent, no LLM. It answers: is this
@@ -36,6 +42,10 @@ export type CiReport = {
   risk: Risk;
   blocked: boolean;
   needsAgent: boolean;
+  // which agent job the pipeline should run: "fix" when an agent can resolve
+  // findings, "review" when nothing is broken or fixable but the risk is
+  // medium or high, "none" for low risk or blockers only a human can resolve
+  agentMode: "fix" | "review" | "none";
   findings: CiFinding[];
   riskSites?: RiskReport;
   markdown: string;
@@ -45,7 +55,7 @@ const git = (args: string, cwd: string) => run(`git ${args}`, { cwd });
 
 // The version the base branch had installed, from its lockfile (npm), else
 // the minimum of its declared range.
-const baseVersion = async (projectRoot: string, base: string, name: string) => {
+export const baseVersion = async (projectRoot: string, base: string, name: string) => {
   const lockRoot = findWorkspaceRoot(projectRoot) ?? projectRoot;
   const rel = path.relative(lockRoot, projectRoot);
   const lock = await git(`show ${base}:./package-lock.json`, lockRoot);
@@ -70,7 +80,7 @@ const baseVersion = async (projectRoot: string, base: string, name: string) => {
   }
 };
 
-const updateType = (from?: string, to?: string): CiReport["upgrades"][number]["updateType"] => {
+export const updateType = (from?: string, to?: string): CiReport["upgrades"][number]["updateType"] => {
   if (!from || !to || !semver.valid(from) || !semver.valid(to)) return "other";
   const diff = semver.diff(from, to);
   return diff === "major" || diff === "premajor"
@@ -193,6 +203,42 @@ export const runCi = async (
       });
     }
     for (const n of riskSites.notes) add({ check: "risk-sites", severity: "info", message: n });
+
+    // behavior changes in the dependency's own code, for the APIs used here
+    const BEHAVIOR = new Set(["default-changed", "constant-changed", "new-throw", "branch-removed"]);
+    for (const u of analyzable) {
+      const used = findApiUsage(projectRoot, u.name).uses.filter((x) => !x.typeOnly && !x.testOnly);
+      if (used.length === 0) continue;
+      const impl = await diffImplementations(
+        projectRoot,
+        u.name,
+        u.from!,
+        u.to!,
+        used.slice(0, 25).map((x) => ({ api: x.api, owner: x.owner, member: x.member })),
+      ).catch(() => undefined);
+      for (const d of impl?.diffs ?? []) {
+        // flags inside newly added functions describe new features (they only
+        // run if the project opts in); the brief keeps them for the reviewer
+        // a changed default can't affect an option the project always sets
+        // (an unconditional `maxRetries: 2`); conditionally set ones stay
+        const setOptions = new Set(
+          used.filter((x) => x.kinds.includes("option") && x.member).map((x) => x.member!),
+        );
+        const overridden = (detail: string) => {
+          const m = /`(?:options|opts|config|params|clientOptions)\.(\w+) (?:\?\?|\|\|)/.exec(detail);
+          return !!m && setOptions.has(m[1]!);
+        };
+        const flags = d.flags.filter(
+          (f) => BEHAVIOR.has(f.kind) && !/\bin new\b/.test(f.detail) && !(f.kind === "default-changed" && overridden(f.detail)),
+        );
+        if (flags.length === 0) continue;
+        add({
+          check: "implementation",
+          severity: "risk",
+          message: `${u.name} \`${d.api}\` changed behavior in its source: ${flags.slice(0, 4).map((f) => `${f.kind} ${f.detail}`).join("; ")}${flags.length > 4 ? "; …" : ""}`,
+        });
+      }
+    }
   }
 
   const blocked = findings.some((f) => f.severity === "blocker");
@@ -205,8 +251,14 @@ export const runCi = async (
         ? "medium"
         : "low";
   const needsAgent = findings.some((f) => f.fixable && f.severity !== "info");
+  const humanOnly = findings.some((f) => f.severity === "blocker" && !f.fixable);
+  const agentMode: CiReport["agentMode"] = needsAgent && !humanOnly
+    ? "fix"
+    : !blocked && risk !== "low"
+      ? "review"
+      : "none";
 
-  const report: Omit<CiReport, "markdown"> = { base: options.base, upgrades, risk, blocked, needsAgent, findings, riskSites };
+  const report: Omit<CiReport, "markdown"> = { base: options.base, upgrades, risk, blocked, needsAgent, agentMode, findings, riskSites };
   return { ...report, markdown: renderMarkdown(report) };
 };
 
@@ -238,10 +290,69 @@ const renderMarkdown = (r: Omit<CiReport, "markdown">) => {
   if (info.length > 0) {
     lines.push("<details><summary>Notes</summary>", "", ...info.map((f) => `- ${f.message}`), "", "</details>", "");
   }
-  if (r.needsAgent) {
+  if (r.agentMode === "fix") {
     lines.push("_The fixable findings above can be handled by the safebump agent job._", "");
+  } else if (r.agentMode === "review") {
+    lines.push("_An agent review will judge these changes against the APIs this project uses and the release notes._", "");
   }
   return lines.join("\n");
 };
 
 export const printCi = (r: CiReport) => console.log(r.markdown);
+
+// whether an agent runs at all is the repo's choice (safebump.yml): the
+// deterministic verdict only says what kind of agent help would apply
+export const effectiveAgentMode = (r: CiReport, config: SafebumpConfig): CiReport["agentMode"] => {
+  if (config.mode !== "ai" || !config.ai) return "none";
+  if (r.agentMode === "fix") return config.ai.fix.enabled ? "fix" : "none";
+  if (r.agentMode === "review") {
+    const review = config.ai.review;
+    if (!review.enabled) return "none";
+    if (review.minRisk === "high" && r.risk !== "high") return "none";
+    if (review.skipPatch && r.upgrades.every((u) => u.updateType === "patch")) return "none";
+    return "review";
+  }
+  return "none";
+};
+
+const reportFile = (projectRoot: string) => path.join(stateDir(projectRoot), "ci-report.json");
+
+export const saveCiReport = (projectRoot: string, r: CiReport) =>
+  writeFileSync(reportFile(projectRoot), JSON.stringify(r, null, 2));
+
+export const loadCiReport = (projectRoot: string): CiReport | undefined => {
+  try {
+    return JSON.parse(readFileSync(reportFile(projectRoot), "utf-8")) as CiReport;
+  } catch {
+    return undefined;
+  }
+};
+
+// the sticky comment and the two statuses: `safebump` (required; red only
+// when broken) and `safebump/automerge` (not required; green only when the
+// deterministic checks prove low risk)
+export const postCi = async (r: CiReport, sha?: string, options: { agentChanged?: boolean } = {}) => {
+  const forge = detectForge();
+  if (!forge) {
+    console.error("--post: not running in GitHub Actions or a GitLab merge request pipeline; nothing posted");
+    return;
+  }
+  await forge.upsertComment(MARKERS.ci, r.markdown);
+  await forge.setStatus(
+    "safebump",
+    r.blocked ? "failure" : "success",
+    r.blocked ? "Blocked: see the safebump comment" : `Not broken (risk: ${r.risk})`,
+    sha,
+  );
+  const automerge = !r.blocked && r.risk === "low" && !options.agentChanged;
+  await forge.setStatus(
+    "safebump/automerge",
+    automerge ? "success" : "failure",
+    options.agentChanged
+      ? "Changed by the safebump agent: needs a human review"
+      : automerge
+        ? "Low risk: eligible to auto-merge"
+        : `Risk ${r.risk}: needs a human review`,
+    sha,
+  );
+};

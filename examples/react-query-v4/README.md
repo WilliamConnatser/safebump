@@ -47,36 +47,54 @@ This installs it at project scope for the agents you pick. Codex, Gemini CLI, Cu
 
 ### In CI, on every Renovate (or Dependabot) PR
 
-The pipeline has two parts. [`.github/workflows/safebump.yml`](.github/workflows/safebump.yml) is the GitHub version and [`.gitlab-ci.yml`](.gitlab-ci.yml) the GitLab one; copy one into your repo, along with [`renovate.json`](renovate.json).
+Run `safebump init` in your repo. It asks a few questions, then writes three files:
+- [`safebump.yml`](safebump.yml), the only configuration
+- the pipeline for your platform: [GitHub Actions](.github/workflows/safebump.yml) or [GitLab CI](.gitlab-ci.yml)
+- a [`renovate.json`](renovate.json)
 
-**1. Assurance, on every dependency PR.** It runs `safebump ci` and uses no agent and no LLM. It answers four questions:
-- **Is the upgrade set complete?** Peers and packages released together, like Expo's SDK packages or react-query with its devtools.
-- **Did anything break compared with the base branch?** Types, tests, lint, build.
+It then prints exactly what to set up on the CI platform. This example's files were generated that way.
+
+```bash
+node .agents/skills/safebump/scripts/safebump.mjs init
+```
+
+**Deterministic mode** is the default, and has no AI and no LLM cost. On every dependency PR, `safebump ci` answers four questions:
+- **Is the upgrade set complete?** Peers and packages released together.
+- **Did anything break relative to the base branch?** Types, tests, lint, build.
 - **Was anything papered over?** Casts, suppressions, weakened tests.
-- **Do the call sites the upgrade is most likely to break run under passing tests?** This uses your test runner's real coverage.
+- **Are the risky changes proven?** It checks that the call sites the upgrade is most likely to break run under passing tests. It also checks the dependency's **own source** for behavior changes in exactly the APIs you use: changed default values, changed constants (timeouts, retry counts), new errors, removed branches.
 
-It posts a sticky PR comment and two statuses:
+It posts a sticky comment and two statuses:
 
 | Status | Red when | Use it as |
 |---|---|---|
 | `safebump` | the upgrade is broken | a **required** status in branch protection |
 | `safebump/automerge` | the update isn't proven low-risk | **not** required: it only vetoes Renovate's auto-merge |
 
-**2. Fix, only when it's needed and an agent is configured.**
-1. In a checkout of the base branch, the agent writes characterization tests for the untested risk sites, and proves them on the *old* version.
-2. It carries those tests over to the PR branch, completes the upgrade set and fixes the breakage.
-3. The assurance runs again on the result before anything is pushed.
+**AI mode** is opt-in: set `mode: ai` in `safebump.yml`, or answer "ai" in `init`. Two jobs are added:
+- **Review**, for medium or high risk with nothing broken. A built-in, sandboxed reviewer reads the APIs you use, what changed in them (types, docs, source), whether tests run them, and the release notes for every version crossed. It grades the risk, can add characterization tests, and posts an assessment. It can raise the risk; it can never make anything auto-merge.
+- **Fix**, for broken or incomplete upgrades. A coding agent writes characterization tests on the base version first, completes the upgrade set, and fixes the breakage. Then the same deterministic checks run on its result.
 
-Changes made by the agent always need a human review.
+**Providers:** Anthropic, Amazon Bedrock, Google Vertex AI, Microsoft Foundry, OpenAI, Azure OpenAI, Google AI, or any OpenAI-compatible endpoint.
+- **Cloud providers** authenticate with OIDC, so there are no stored keys.
+- **On GitHub, fix mode** uses each vendor's own action: `claude-code-action`, `codex-action` or `run-gemini-cli`.
+- **On GitLab**, safebump runs the agent's CLI.
 
-**The Renovate config** comes from `safebump renovate-config`; regenerate it for your repo with:
-```bash
-node .agents/skills/safebump/scripts/safebump.mjs renovate-config > renovate.json
+```yaml
+# safebump.yml: AI mode on Bedrock
+version: 1
+mode: ai
+ci: { platform: github, failOn: blocked, coverage: true }
+ai:
+  provider: bedrock
+  model: <your Bedrock model id>
+  region: us-east-1
+  review: { enabled: true, minRisk: medium, skipPatch: true }
+  fix: { enabled: true, agent: claude-code }
 ```
-- **Grouping:** packages released together become one PR, so the upgrade set is complete.
-- **Settling time:** new releases wait three days before a PR opens.
-- **Auto-merge:** patch and minor updates auto-merge, and only when every status is green. With `platformAutomerge: false`, Renovate checks the statuses itself, so `safebump/automerge` decides. Majors always wait for a human.
 
-**Who owns the branch:** once the fix job pushes, Renovate stops rebasing that branch, which is what keeps the fixes from being overwritten. To get a newer version, ask Renovate to recreate the PR from its dashboard.
+After changing `safebump.yml`, regenerate the pipeline with `safebump init --write-ci`.
+
+**The Renovate config** groups packages released together into one PR, waits three days after a release, and auto-merges patch and minor updates only when every status is green. With `platformAutomerge: false`, Renovate checks the statuses itself, so `safebump/automerge` decides. Majors always wait for a human. Once a safebump agent pushes to a PR, Renovate stops rebasing that branch, so the fixes aren't overwritten.
 
 For a monorepo, run the job per package with `defaults.run.working-directory`.
