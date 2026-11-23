@@ -1,0 +1,118 @@
+{
+  "$comment": "Official migration tools, matched by package name. Placeholders: {to} = target version, {toMajor} = target major, {pm} = package manager, {pmx} = its package runner (npx, pnpm dlx, yarn dlx, bunx). Every entry needs a source URL; add entries only from official docs.",
+  "tools": [
+    {
+      "id": "expo-sdk",
+      "match": [
+        "expo",
+        "expo-*",
+        "babel-preset-expo",
+        "@expo/*"
+      ],
+      "summary": "Expo SDK upgrade. Upgrade one SDK version at a time. `expo install --fix` aligns every Expo package (and React Native) with the SDK, so don't set expo-* versions by hand.",
+      "steps": [
+        "{pm} install expo@^{toMajor}.0.0",
+        "{pmx} expo install --fix",
+        "{pmx} expo-doctor",
+        "With Continuous Native Generation, delete android/ and ios/ so the next build regenerates them; otherwise run pod-install and apply the native upgrade helper diff"
+      ],
+      "oneMajorAtATime": true,
+      "replacesUpgrade": true,
+      "guide": "https://docs.expo.dev/workflow/upgrading-expo-sdk-walkthrough/",
+      "changelog": "https://expo.dev/changelog/sdk-{toMajor}",
+      "source": "https://docs.expo.dev/workflow/upgrading-expo-sdk-walkthrough/"
+    },
+    {
+      "id": "tamagui-3",
+      "match": [
+        "tamagui",
+        "@tamagui/*"
+      ],
+      "fromMajor": 2,
+      "toMajor": 3,
+      "summary": "Tamagui 2 \u2192 3. Bump tamagui and every @tamagui/* package together and check the lockfile has no duplicate @tamagui/core or tamagui. The CLI prints the migration checklist and runs codemods (run them in report mode first, then --write).",
+      "steps": [
+        "{pmx} @tamagui/cli migrate --from v2"
+      ],
+      "oneMajorAtATime": true,
+      "replacesUpgrade": false,
+      "guide": "https://tamagui.dev/tailwind/guides/how-to-upgrade",
+      "changelog": "https://tamagui.dev/blog/version-three",
+      "source": "https://tamagui.dev/tailwind/guides/how-to-upgrade"
+    },
+    {
+      "id": "react-query-5",
+      "match": [
+        "@tanstack/react-query"
+      ],
+      "fromMajor": 4,
+      "toMajor": 5,
+      "summary": "Codemod for the removed positional overloads (useQuery(key, fn, opts) \u2192 useQuery({ queryKey, queryFn, ...opts })). Run after installing v5.",
+      "steps": [
+        "{pmx} jscodeshift@latest ./src/ --extensions=ts,tsx --parser=tsx --transform=./node_modules/@tanstack/react-query/build/codemods/src/v5/remove-overloads/remove-overloads.cjs"
+      ],
+      "replacesUpgrade": false,
+      "guide": "https://tanstack.com/query/v5/docs/framework/react/guides/migrating-to-v5",
+      "source": "https://tanstack.com/query/v5/docs/framework/react/guides/migrating-to-v5"
+    },
+    {
+      "id": "angular",
+      "match": [
+        "@angular/core",
+        "@angular/*"
+      ],
+      "summary": "Angular. `ng update` bumps the framework packages together and runs their migration schematics. Follow the interactive update guide for the from/to pair.",
+      "steps": [
+        "{pmx} ng update @angular/cli@^{toMajor} @angular/core@^{toMajor}"
+      ],
+      "replacesUpgrade": true,
+      "guide": "https://angular.dev/update-guide",
+      "source": "https://angular.dev/cli/update"
+    },
+    {
+      "id": "nx",
+      "match": [
+        "nx",
+        "@nx/*"
+      ],
+      "summary": "Nx. `nx migrate <version>` updates package.json and writes migrations.json; install, then run the migrations. Go one major at a time (required for Angular workspaces).",
+      "steps": [
+        "{pmx} nx migrate {to}",
+        "{pm} install",
+        "{pmx} nx migrate --run-migrations"
+      ],
+      "replacesUpgrade": true,
+      "guide": "https://nx.dev/docs/guides/tips-n-tricks/advanced-update",
+      "source": "https://nx.dev/docs/guides/tips-n-tricks/advanced-update",
+      "oneMajorAtATime": true
+    },
+    {
+      "id": "next",
+      "match": [
+        "next"
+      ],
+      "summary": "Next.js. The upgrade codemod bumps next, react and react-dom together and runs the codemods; non-interactive under an agent or CI.",
+      "steps": [
+        "{pmx} @next/codemod upgrade {toMajor}"
+      ],
+      "replacesUpgrade": true,
+      "guide": "https://nextjs.org/docs/app/guides/upgrading",
+      "source": "https://nextjs.org/docs/app/guides/upgrading/codemods"
+    },
+    {
+      "id": "storybook",
+      "match": [
+        "storybook",
+        "@storybook/*"
+      ],
+      "summary": "Storybook. `storybook upgrade` bumps every Storybook package together, runs automigrations and a health check. One major at a time (6 \u2192 8 is the exception).",
+      "steps": [
+        "{pmx} storybook@{toMajor} upgrade"
+      ],
+      "replacesUpgrade": true,
+      "guide": "https://storybook.js.org/docs/releases/upgrading",
+      "source": "https://storybook.js.org/docs/releases/upgrading",
+      "oneMajorAtATime": true
+    }
+  ]
+}
