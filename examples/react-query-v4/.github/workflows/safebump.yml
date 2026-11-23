@@ -1,24 +1,39 @@
-# Runs the safebump skill on any PR that changes dependencies and breaks the
-# type check, then pushes the fixes to the PR branch. It doesn't matter who
-# opened the PR: Dependabot, Renovate, another bot or a person.
+# safebump on every dependency-update PR: Renovate, Dependabot, or a person.
 #
-# Configure under Settings → Secrets and variables → Actions:
+# 1. assure (every PR that changes package.json or a lockfile; no agent, no
+#    LLM cost). It checks that:
+#    - the upgrade set is complete (peers, packages released together)
+#    - nothing broke relative to the base branch (types, tests, lint, build)
+#    - nothing was papered over (audit)
+#    - the call sites the upgrade is most likely to break run under passing
+#      tests (runtime coverage)
+#    It posts a sticky PR comment and two commit statuses:
+#      safebump            red when the upgrade is broken. Make this a
+#                          REQUIRED status in branch protection.
+#      safebump/automerge  green only for low-risk updates. Don't make it
+#                          required: Renovate (with platformAutomerge: false)
+#                          only merges when every status is green, so this
+#                          vetoes auto-merge without blocking humans.
+# 2. fix (only when assure finds fixable problems and an agent is configured).
+#    It writes characterization tests on the BASE version first and proves
+#    them, then fixes the upgrade, re-runs the assurance, and pushes.
 #
-#   Variable SAFEBUMP_AGENT: claude | codex | gemini | custom   (default: claude)
+# Setup (Settings → Secrets and variables → Actions):
+#   Variable SAFEBUMP_AGENT: claude | codex | gemini | custom | off (default: off,
+#     assure only)
+#   Variable SAFEBUMP_AGENT_CMD: the command for "custom"; the prompt's path is
+#     in $SAFEBUMP_PROMPT_FILE
 #   Variable SAFEBUMP_TYPECHECK (optional): type-check command, if detection
-#            picks the wrong one
-#
-#   Secret for the agent you picked:
-#     claude  CLAUDE_CODE_OAUTH_TOKEN (subscription, from `claude setup-token`)
-#             or ANTHROPIC_API_KEY
-#     codex   OPENAI_API_KEY
-#     gemini  GEMINI_API_KEY
-#     custom  set variable SAFEBUMP_AGENT_CMD to a shell command that runs your
-#             agent headless. The prompt's path is in $SAFEBUMP_PROMPT_FILE.
-#             Put any keys it needs in secrets and add them to the "Fix" step.
-#
-# Some update bots trigger workflows that can only read the bot's own secret
-# store. Dependabot is one: add the same secret under Secrets → Dependabot too.
+#     picks the wrong one
+#   Secret for the agent: CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY,
+#     OPENAI_API_KEY, or GEMINI_API_KEY
+#   Secret SAFEBUMP_PUSH_TOKEN (optional): a fine-grained token or GitHub App
+#     token with contents:write. Pushes made with the default GITHUB_TOKEN
+#     don't trigger new workflow runs, so without it the fix job sets the
+#     statuses on its own commit itself.
+# Pair with the renovate.json next to this file (`safebump renovate-config`
+# generates one for your repo). Dependabot-triggered runs can only read
+# Dependabot secrets: add the agent secret there too.
 name: safebump
 
 on:
@@ -33,41 +48,48 @@ on:
       - "**/bun.lockb"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: safebump-${{ github.head_ref }}
   cancel-in-progress: true
 
+env:
+  BASE_REF: origin/${{ github.base_ref }}
+  SAFEBUMP: ${{ github.workspace }}/../safebump-skill/skills/safebump/scripts/safebump
+  SAFEBUMP_TYPECHECK: ${{ vars.SAFEBUMP_TYPECHECK }}
+
 jobs:
-  safebump:
-    # skip PRs from forks: their branches can't be pushed to with this token
+  assure:
+    name: safebump assurance
+    # PRs from forks can't receive statuses or comments with this token
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      BASE_REF: origin/${{ github.base_ref }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    outputs:
+      risk: ${{ steps.ci.outputs.risk }}
+      blocked: ${{ steps.ci.outputs.blocked }}
+      needs_agent: ${{ steps.ci.outputs.needs_agent }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-          # the agent step runs untrusted text (release notes, package docs);
-          # keep the push token out of the working copy
           persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Fetch the safebump skill
-        uses: actions/checkout@v4
-        with:
-          repository: WilliamConnatser/safebump
-          path: ${{ runner.temp }}/safebump
-          sparse-checkout: skills/safebump
-          persist-credentials: false
+      - name: Fetch safebump
+        run: |
+          git clone --quiet --depth 1 --filter=blob:none --sparse \
+            https://github.com/WilliamConnatser/safebump.git ../safebump-skill
+          git -C ../safebump-skill sparse-checkout set skills/safebump
 
       - name: Install dependencies
         run: |
@@ -80,133 +102,161 @@ jobs:
           EOF
           bash "$RUNNER_TEMP/install.sh"
 
-      # uses the project's own checker (typecheck script, ts-rust, tsgo,
-      # vue-tsc or tsc); set the SAFEBUMP_TYPECHECK variable to override
-      - name: Type check
-        id: tsc
-        env:
-          SAFEBUMP_TYPECHECK: ${{ vars.SAFEBUMP_TYPECHECK }}
-        run: |
-          if "$RUNNER_TEMP/safebump/skills/safebump/scripts/safebump" tsc; then
-            echo "clean=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "clean=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # a broken install or missing checker produces errors that look like
-      # upgrade breakage; stop before spending an agent run on them
-      - name: Preflight
-        if: steps.tsc.outputs.clean == 'false'
-        env:
-          SAFEBUMP_TYPECHECK: ${{ vars.SAFEBUMP_TYPECHECK }}
-        run: |
-          "$RUNNER_TEMP/safebump/skills/safebump/scripts/safebump" doctor
-
-      # failures that already exist on the base branch aren't the agent's to
-      # fix; record them so `verify` only reports new ones
+      # failures that already exist on the base branch aren't this PR's
       - name: Baseline on the base branch
-        if: steps.tsc.outputs.clean == 'false'
-        env:
-          SAFEBUMP_TYPECHECK: ${{ vars.SAFEBUMP_TYPECHECK }}
         run: |
-          git worktree add "$RUNNER_TEMP/base" "$BASE_REF"
-          cd "$RUNNER_TEMP/base"
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_REF"
+          (cd "$RUNNER_TEMP/base" && bash "$RUNNER_TEMP/install.sh" && "$SAFEBUMP" verify baseline)
+          mkdir -p .safebump && cp "$RUNNER_TEMP/base/.safebump/baseline.json" .safebump/
+
+      - name: Assurance
+        id: ci
+        continue-on-error: true
+        run: |
+          "$SAFEBUMP" ci --base "$BASE_REF" --markdown "$RUNNER_TEMP/safebump.md"
+
+      - name: Comment and statuses
+        if: always() && steps.ci.outputs.risk != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          RISK: ${{ steps.ci.outputs.risk }}
+          BLOCKED: ${{ steps.ci.outputs.blocked }}
+        run: |
+          body="$(printf '<!-- safebump -->\n'; cat "$RUNNER_TEMP/safebump.md")"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '[.[] | select(.body | startswith("<!-- safebump -->"))][0].id // empty')
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$body" > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" > /dev/null
+          fi
+          status() { gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$2" -f context="$1" -f description="$3" > /dev/null; }
+          if [ "$BLOCKED" = "true" ]; then status safebump failure "Blocked: see the safebump comment"
+          else status safebump success "Not broken (risk: $RISK)"; fi
+          if [ "$BLOCKED" != "true" ] && [ "$RISK" = "low" ]; then status safebump/automerge success "Low risk: eligible to auto-merge"
+          else status safebump/automerge failure "Risk $RISK: needs a human review"; fi
+
+      - name: Fail when blocked
+        if: steps.ci.outputs.blocked == 'true'
+        run: exit 1
+
+  fix:
+    name: safebump fix
+    needs: assure
+    if: >-
+      always() && needs.assure.outputs.needs_agent == 'true' &&
+      vars.SAFEBUMP_AGENT != '' && vars.SAFEBUMP_AGENT != 'off'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          # the agent reads untrusted text (release notes, package docs);
+          # keep push credentials out of the working copy
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fetch safebump and install
+        run: |
+          git clone --quiet --depth 1 --filter=blob:none --sparse \
+            https://github.com/WilliamConnatser/safebump.git ../safebump-skill
+          git -C ../safebump-skill sparse-checkout set skills/safebump
+          cat > "$RUNNER_TEMP/install.sh" <<'EOF'
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then command -v bun >/dev/null || npm install -g bun; bun install --frozen-lockfile
+          elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then corepack enable && yarn install
+          else npm ci
+          fi
+          EOF
           bash "$RUNNER_TEMP/install.sh"
-          "$RUNNER_TEMP/safebump/skills/safebump/scripts/safebump" verify baseline
-          mkdir -p "$GITHUB_WORKSPACE/.safebump"
-          cp .safebump/baseline.json "$GITHUB_WORKSPACE/.safebump/"
-          printf '*\n' > "$GITHUB_WORKSPACE/.safebump/.gitignore"
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_REF"
+          (cd "$RUNNER_TEMP/base" && bash "$RUNNER_TEMP/install.sh" && "$SAFEBUMP" verify baseline)
+          mkdir -p .safebump && cp "$RUNNER_TEMP/base/.safebump/baseline.json" .safebump/
+          "$SAFEBUMP" ci --base "$BASE_REF" --markdown "$RUNNER_TEMP/before.md" || true
 
       - name: Write the prompt
-        if: steps.tsc.outputs.clean == 'false'
         run: |
-          cat > "$RUNNER_TEMP/safebump-prompt.md" <<EOF
-          Read and follow the skill at $RUNNER_TEMP/safebump/skills/safebump/SKILL.md, in its unattended mode.
+          cat > "$RUNNER_TEMP/prompt.md" <<EOF
+          Read and follow the skill at $GITHUB_WORKSPACE/../safebump-skill/skills/safebump/SKILL.md, in unattended mode, section "CI fix mode".
 
-          This branch already bumps one or more dependencies in package.json, and dependencies are installed.
-          Find what was bumped with: $RUNNER_TEMP/safebump/skills/safebump/scripts/safebump detect $BASE_REF
-          Run plan on those packages and complete the upgrade set if the bot bumped only part of it.
-          Then fix the code. A verify baseline from the base branch is already recorded.
+          This is a dependency-update PR. The base branch is checked out, with its dependencies installed, at:
+            $RUNNER_TEMP/base
+          safebump's assurance report for this PR is at $RUNNER_TEMP/before.md.
 
-          Write your report to $RUNNER_TEMP/safebump-report.md.
+          Write your report to $RUNNER_TEMP/report.md.
           EOF
 
       - name: Fix
-        if: steps.tsc.outputs.clean == 'false'
         env:
-          SAFEBUMP_AGENT: ${{ vars.SAFEBUMP_AGENT || 'claude' }}
+          SAFEBUMP_AGENT: ${{ vars.SAFEBUMP_AGENT }}
           SAFEBUMP_AGENT_CMD: ${{ vars.SAFEBUMP_AGENT_CMD }}
-          SAFEBUMP_PROMPT_FILE: ${{ runner.temp }}/safebump-prompt.md
-          SAFEBUMP_TYPECHECK: ${{ vars.SAFEBUMP_TYPECHECK }}
+          SAFEBUMP_PROMPT_FILE: ${{ runner.temp }}/prompt.md
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        # The runner is a throwaway VM with no push credentials, so each agent
-        # runs without its own sandbox or permission prompts. Flags change
-        # between releases; check your agent's docs for headless mode.
+        # a throwaway VM with no push credentials, so agents run without their
+        # own sandbox; flags change between releases, check your agent's docs
         run: |
           PROMPT="$(cat "$SAFEBUMP_PROMPT_FILE")"
           case "$SAFEBUMP_AGENT" in
-            claude)
-              npm install -g @anthropic-ai/claude-code
-              claude -p "$PROMPT" --dangerously-skip-permissions
-              ;;
-            codex)
-              npm install -g @openai/codex
-              printenv OPENAI_API_KEY | codex login --with-api-key
-              codex exec --dangerously-bypass-approvals-and-sandbox "$PROMPT"
-              ;;
-            gemini)
-              npm install -g @google/gemini-cli
-              gemini -p "$PROMPT" --yolo
-              ;;
-            custom)
-              bash -c "$SAFEBUMP_AGENT_CMD"
-              ;;
-            *)
-              echo "Unknown SAFEBUMP_AGENT: $SAFEBUMP_AGENT" >&2
-              exit 1
-              ;;
+            claude) npm install -g @anthropic-ai/claude-code && claude -p "$PROMPT" --dangerously-skip-permissions ;;
+            codex)  npm install -g @openai/codex && printenv OPENAI_API_KEY | codex login --with-api-key && codex exec --dangerously-bypass-approvals-and-sandbox "$PROMPT" ;;
+            gemini) npm install -g @google/gemini-cli && gemini -p "$PROMPT" --yolo ;;
+            custom) bash -c "$SAFEBUMP_AGENT_CMD" ;;
+            *) echo "Unknown SAFEBUMP_AGENT: $SAFEBUMP_AGENT" >&2; exit 1 ;;
           esac
 
-      # don't take the agent's word for it
-      - name: Verify and audit
-        id: gates
-        if: steps.tsc.outputs.clean == 'false'
-        env:
-          SAFEBUMP_TYPECHECK: ${{ vars.SAFEBUMP_TYPECHECK }}
+      # don't take the agent's word for it: the same assurance, on its result
+      - name: Re-assure
+        id: ci
+        continue-on-error: true
         run: |
-          B="$RUNNER_TEMP/safebump/skills/safebump/scripts/safebump"
-          status=0
-          { echo "## safebump checks"; echo; echo '```'; } > "$RUNNER_TEMP/gates.md"
-          "$B" verify >> "$RUNNER_TEMP/gates.md" 2>&1 || status=1
-          "$B" audit HEAD >> "$RUNNER_TEMP/gates.md" 2>&1 || status=1
-          echo '```' >> "$RUNNER_TEMP/gates.md"
-          echo "ok=$([ $status = 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          git worktree remove --force "$RUNNER_TEMP/base"
+          "$SAFEBUMP" ci --base "$BASE_REF" --markdown "$RUNNER_TEMP/safebump.md"
 
-      - name: Commit and push
-        if: steps.tsc.outputs.clean == 'false'
+      - name: Commit, push, comment and statuses
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSH_TOKEN: ${{ secrets.SAFEBUMP_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          RISK: ${{ steps.ci.outputs.risk }}
+          BLOCKED: ${{ steps.ci.outputs.blocked }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "fix(deps): adapt code to dependency upgrade"
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${{ github.head_ref }}"
-          fi
-          report="$RUNNER_TEMP/safebump-report.md"
-          [ -f "$report" ] || "$RUNNER_TEMP/safebump/skills/safebump/scripts/safebump" report "$BASE_REF" > "$report"
-          if [ "${{ steps.gates.outputs.ok }}" != "true" ]; then
-            printf '> [!WARNING]\n> safebump checks failed; see below before merging.\n\n' | cat - "$report" > "$report.tmp" && mv "$report.tmp" "$report"
-          fi
-          cat "$RUNNER_TEMP/gates.md" >> "$report"
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file "$report"
-
-      - name: Fail if checks failed
-        if: steps.gates.outputs.ok == 'false'
-        run: exit 1
+          git config user.name "safebump[bot]"
+          git config user.email "safebump@users.noreply.github.com"
+          git add -A -- . ':!.safebump'
+          if git diff --cached --quiet; then echo "The agent made no changes"; exit 0; fi
+          # project git hooks (installed by the install step) may refuse CI
+          # commits; this job's own re-assurance is the gate here
+          git commit --no-verify -m "fix(deps): adapt code to the dependency upgrade" -m "Applied by the safebump fix job."
+          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_HEAD_REF}"
+          sha=$(git rev-parse HEAD)
+          {
+            printf '<!-- safebump -->\n'
+            cat "$RUNNER_TEMP/safebump.md"
+            if [ -f "$RUNNER_TEMP/report.md" ]; then printf '\n### What the agent changed\n\n'; cat "$RUNNER_TEMP/report.md"; fi
+          } > "$RUNNER_TEMP/comment.md"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '[.[] | select(.body | startswith("<!-- safebump -->"))][0].id // empty')
+          if [ -n "$id" ]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@"$RUNNER_TEMP/comment.md" > /dev/null
+          else gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@"$RUNNER_TEMP/comment.md" > /dev/null; fi
+          # a push with the default token starts no new run, so set the
+          # statuses for the new commit from the re-assurance just done
+          status() { gh api "repos/$GITHUB_REPOSITORY/statuses/$sha" -f state="$2" -f context="$1" -f description="$3" > /dev/null; }
+          if [ "$BLOCKED" = "true" ]; then status safebump failure "Still blocked after the fix: see the comment"
+          else status safebump success "Not broken after the fix (risk: $RISK)"; fi
+          # agent-written changes always get a human look before merging
+          status safebump/automerge failure "Changed by the safebump agent: needs a human review"

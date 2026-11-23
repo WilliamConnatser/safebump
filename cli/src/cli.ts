@@ -1,3 +1,4 @@
+import { appendFileSync, writeFileSync } from "fs";
 import path from "path";
 import { parseArgs } from "util";
 
@@ -20,6 +21,8 @@ import { findNotes, printNotes, saveNote } from "./lib/notes";
 import type { UpgradePlan } from "./lib/plan";
 import type { MigrationTool } from "./lib/migration-tools";
 import { auditDiff, printAudit } from "./lib/audit";
+import { printCi, runCi } from "./lib/ci";
+import { renovateConfig } from "./lib/renovate";
 import { previewImpact, printImpact } from "./lib/impact";
 import { findMigrationTools, printMigrationTools } from "./lib/migration-tools";
 import { buildReport } from "./lib/report";
@@ -59,6 +62,16 @@ import { planUpgrades } from "./lib/plan";
 const USAGE = `Usage: safebump <command> [args] [options]
 
 Commands:
+  ci --base <ref>           Assurance pass for a dependency-update PR (Renovate, Dependabot, manual), no agent:
+                            doctor, what was bumped and from what, complete upgrade set, duplicates, new failures
+                            vs the base-branch baseline, audit, and risk sites proven by tests (runtime coverage).
+                            Verdict low/medium/high or blocked. Exit 1 when blocked, or at/above --fail-on
+                            <medium|high>. --markdown <file> writes the PR comment; --outputs <file> writes
+                            RISK/BLOCKED/NEEDS_AGENT as dotenv (GITHUB_OUTPUT is written automatically);
+                            --skip-coverage skips the test run used for risk sites
+  renovate-config           A renovate.json that cooperates with safebump: package families grouped into one PR
+                            (from source repos / scopes), automerge for patch/minor gated by the
+                            safebump/automerge status, majors always reviewed. Prints JSON
   doctor [pkg[@version]...] Preflight: install matches manifests and lockfile, type checker resolves, tsconfig,
                             git state, Node vs engines (incl. the targets'), duplicate copies; exit 1 on failure
   list                      Major-version upgrades available (all workspaces when run at a workspace root)
@@ -296,6 +309,11 @@ const main = async () => {
       timeout: { type: "string" },
       fast: { type: "boolean", default: false },
       coverage: { type: "boolean", default: false },
+      base: { type: "string" },
+      "fail-on": { type: "string" },
+      markdown: { type: "string" },
+      outputs: { type: "string" },
+      "skip-coverage": { type: "boolean", default: false },
       confirm: { type: "boolean", default: false },
       deprecations: { type: "boolean", default: false },
       errors: { type: "string" },
@@ -350,6 +368,32 @@ const main = async () => {
       const r = await previewImpact(root, parseTargets(args));
       const { plan: _plan, ...report } = r;
       return out(report, () => printImpact(r));
+    }
+    case "ci": {
+      if (!values.base) {
+        console.error("ci needs --base <ref>, e.g. --base origin/main");
+        process.exit(2);
+      }
+      const r = await runCi(root, {
+        base: values.base,
+        checker: resolveChecker(root, values.checker),
+        coverage: !values["skip-coverage"],
+        timeoutMs: values.timeout ? Number(values.timeout) * 1000 : undefined,
+      });
+      if (values.markdown) writeFileSync(values.markdown, r.markdown);
+      const lines = [`RISK=${r.risk}`, `BLOCKED=${r.blocked}`, `NEEDS_AGENT=${r.needsAgent}`];
+      if (values.outputs) writeFileSync(values.outputs, `${lines.join("\n")}\n`);
+      if (process.env.GITHUB_OUTPUT) {
+        appendFileSync(process.env.GITHUB_OUTPUT, `${lines.map((l) => l.toLowerCase().replace(/^([a-z_]+)=/, (m) => m)).join("\n")}\n`);
+      }
+      const order = ["low", "medium", "high"];
+      const failOn = values["fail-on"];
+      if (r.blocked || (failOn && order.indexOf(r.risk) >= order.indexOf(failOn))) process.exitCode = 1;
+      return out(r, () => printCi(r));
+    }
+    case "renovate-config": {
+      console.log(JSON.stringify(renovateConfig(root), null, 2));
+      return;
     }
     case "doctor": {
       const r = await runDoctor(root, { packages: args, checker: values.checker });

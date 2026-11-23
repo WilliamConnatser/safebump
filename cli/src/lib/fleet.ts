@@ -36,7 +36,7 @@ export type FleetPlan = {
 };
 
 // "github.com/expo/expo" from any of the repository field's forms
-const repoKey = (repo: string | { url?: string } | undefined) => {
+export const repoKey = (repo: string | { url?: string } | undefined) => {
   const url = typeof repo === "string" ? repo : repo?.url;
   const m = url && /github\.com[/:]([^/]+\/[^/.#]+)/i.exec(url);
   if (m?.[1]) return `github.com/${m[1].toLowerCase()}`;

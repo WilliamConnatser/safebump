@@ -4,7 +4,7 @@ description: Upgrade TypeScript/TSX dependencies to new major versions and fix t
 license: MIT
 compatibility: Requires Node 20+, git, and a TypeScript project with a tsconfig.json. Network access to the npm registry; also helps for reading release notes.
 metadata:
-  version: "3.2.0"
+  version: "3.3.0"
 ---
 
 # safebump
@@ -161,6 +161,26 @@ When you are run without a human to ask, such as in a CI job, these changes appl
 - **`doctor`, `verify` and `audit` are mandatory.** If `doctor` fails, stop and report. If `verify` or `audit` fails and you can't fix it, say so at the top of the report.
 - **Restore on stall without asking.** Use `checkpoint restore best`, and stop when a second approach also stalls.
 - **Write the report** (the `report` output, filled in) as Markdown to the path you were given.
+
+### CI fix mode (dependency-update PRs)
+
+The CI pipeline runs you after its assurance pass (`safebump ci`) found fixable problems on a PR opened by Renovate, Dependabot or a person. Its report and a checked-out base branch are given to you. Do this, in order:
+
+1. **Read the report.** Each finding is one of:
+   - **incomplete upgrade set:** a package that must move too
+   - **duplicate install:** the same package installed in two versions
+   - **new failure** compared with the base branch: type, test, lint or build
+   - **unexecuted risk site:** a risky call site no test runs
+2. **Characterization tests, on the base version first.** For every unexecuted risk site:
+   1. Write tests in the **base worktree**, following [references/characterization-tests.md](references/characterization-tests.md).
+   2. Prove them there: `safebump test-gaps <pkg>@<new-version> --confirm --root <base worktree>` must pass.
+   3. Copy the new test files into the PR checkout at the same paths. They're the contract the upgrade must keep.
+3. **Complete the set:** `upgrade` any missing packages from the report, then check `duplicates`.
+4. **Fix the code** with the fix loop (step 4 of the workflow), until `verify` reports no new failures. If a characterization test fails on the new version, that's a real behavior change: fix the code to preserve the old behavior. Never weaken the test.
+5. **Pin changed defaults** the report lists, as in step 5 of the workflow.
+6. **Re-run `safebump ci --base <base ref>`.** Write your report: what you fixed, which tests you added and what they pin, and anything you couldn't resolve.
+
+The CI job, not you, commits, pushes and sets statuses. Anything the agent changed always gets a human review before merging.
 
 ## Rules for every fix
 

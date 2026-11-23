@@ -63,7 +63,9 @@ const WEIGHT = {
 export const findRiskSites = async (
   projectRoot: string,
   gaps: TestGaps,
-  targets: { name: string; to: string }[],
+  // `from` defaults to the installed version; on a branch that's already
+  // bumped (a bot's PR) pass the base branch's version instead
+  targets: { name: string; from?: string; to: string }[],
   options: { deprecations?: boolean } = {},
 ): Promise<RiskReport> => {
   const sites = new Map<string, RiskSite>();
@@ -86,7 +88,7 @@ export const findRiskSites = async (
       .filter((f) => f.packages.includes(target.name))
       .flatMap((f) => f.usages.map((u) => ({ file: f.file, ...u })));
 
-    const diff = await diffApi(projectRoot, target.name, undefined, target.to).catch((e: unknown) => {
+    const diff = await diffApi(projectRoot, target.name, target.from, target.to).catch((e: unknown) => {
       notes.push(`${target.name}: API diff failed (${e instanceof Error ? e.message : String(e)})`);
       return undefined;
     });
@@ -130,7 +132,7 @@ export const findRiskSites = async (
       }
     }
 
-    const defaults = await findDefaultReliance(projectRoot, target.name, undefined, target.to).catch(
+    const defaults = await findDefaultReliance(projectRoot, target.name, target.from, target.to).catch(
       (e: unknown) => {
         notes.push(`${target.name}: default analysis failed (${e instanceof Error ? e.message : String(e)})`);
         return undefined;

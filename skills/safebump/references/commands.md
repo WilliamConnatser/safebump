@@ -6,6 +6,16 @@ Output of `scripts/safebump --help`:
 Usage: safebump <command> [args] [options]
 
 Commands:
+  ci --base <ref>           Assurance pass for a dependency-update PR (Renovate, Dependabot, manual), no agent:
+                            doctor, what was bumped and from what, complete upgrade set, duplicates, new failures
+                            vs the base-branch baseline, audit, and risk sites proven by tests (runtime coverage).
+                            Verdict low/medium/high or blocked. Exit 1 when blocked, or at/above --fail-on
+                            <medium|high>. --markdown <file> writes the PR comment; --outputs <file> writes
+                            RISK/BLOCKED/NEEDS_AGENT as dotenv (GITHUB_OUTPUT is written automatically);
+                            --skip-coverage skips the test run used for risk sites
+  renovate-config           A renovate.json that cooperates with safebump: package families grouped into one PR
+                            (from source repos / scopes), automerge for patch/minor gated by the
+                            safebump/automerge status, majors always reviewed. Prints JSON
   doctor [pkg[@version]...] Preflight: install matches manifests and lockfile, type checker resolves, tsconfig,
                             git state, Node vs engines (incl. the targets'), duplicate copies; exit 1 on failure
   list                      Major-version upgrades available (all workspaces when run at a workspace root)
@@ -71,7 +81,7 @@ Options:
 ```
 ## Exit codes
 
-- `tsc`, `verify`, `audit`, `doctor`, `duplicates` and `checkpoint list` exit 1 when they find problems, so they can gate CI and the fix loop.
+- `tsc`, `verify`, `audit`, `doctor`, `duplicates`, `checkpoint list`, `test-gaps --confirm` and `ci` exit 1 when they find problems, so they can gate CI and the fix loop.
 - Every command exits 1 on an operational error, such as a missing type checker or a failed install, with the message on stderr.
 
 ## Files safebump writes
